@@ -4,7 +4,6 @@ import serial
 import serial.tools.list_ports
 import threading
 import time
-from gdx import gdx
 import pandas as pd
 from PIL import Image, ImageTk
 import h5py
@@ -13,7 +12,6 @@ import os
 import sys
 from tkinter import simpledialog
 import matplotlib
-import nest_asyncio
 
 # before rebuilding, remove scikit learn and joblib and whatever else for analysis
 
@@ -100,7 +98,6 @@ class WalkerMonitorApp:
         self.bluetooth_button.grid(row=5, column=0, padx=5, pady=5)
 
         # Initialize variables
-        self.gdx = gdx.gdx()
         self.serial = None
         self.bluetooth_connected = False
         self.is_recording = False
@@ -215,19 +212,6 @@ class WalkerMonitorApp:
                                         self.data['lr'].append((timestamp, lr))
                                         self.data['lf'].append((timestamp, lf))
 
-                                        '''if self.bluetooth_connected:
-                                            try:
-                                                measurements = self.gdx.read()
-                                                if measurements is not None:
-                                                    if len(measurements) ==  6:
-                                                        self.hand_data['lhf'].append((timestamp, measurements[0]))
-                                                        self.hand_data['lhx'].append((timestamp, measurements[1]))
-                                                        self.hand_data['lhy'].append((timestamp, measurements[2]))
-                                                        self.hand_data['rhf'].append((timestamp, measurements[3]))
-                                                        self.hand_data['rhx'].append((timestamp, measurements[4]))
-                                                        self.hand_data['rhy'].append((timestamp, measurements[5]))
-                                            except BaseException:
-                                                pass'''
 
                                 except ValueError:
                                     if self.finished_startup:
@@ -259,13 +243,6 @@ class WalkerMonitorApp:
 
     def connect_bluetooth(self):
         pass # TODO reactive once working
-        # self.update_status("Connecting to dynos..")
-        #self.gdx.open(connection='ble', device_to_open='GDX-HD 15500050, GDX-HD 15400845')
-        #self.gdx.select_sensors([[1, 2, 3], [1, 2, 3]])
-        #if len(self.gdx.devices) == 2:
-        #    self.bluetooth_connected = True
-        #    nest_asyncio.apply()
-        #   self.update_status("Connected to dynos!")
 
     def start_recording(self):
         self.reset_data()
@@ -280,8 +257,7 @@ class WalkerMonitorApp:
         self.unsaved_data = True
         # Capture the starting timestamp
         self.recording_start = time.time()
-        #if self.bluetooth_connected:
-        #    self.gdx.start(100)
+
 
     def stop_recording(self):
         self.is_recording = False
@@ -294,8 +270,6 @@ class WalkerMonitorApp:
         self.save_data_button.config(state="normal")
         self.view_data_button.config(state="normal")
         self.update_status("Ready")
-        #if self.bluetooth_connected:
-        #    self.gdx.stop()
 
     def close_window(self):
         self.update_status("Closing down...")
@@ -305,9 +279,6 @@ class WalkerMonitorApp:
         if self.serial and self.serial.is_open:
             self.serial.close()
 
-        #if self.bluetooth_connected:
-        #    self.gdx.stop()
-        #    self.gdx.close()
 
         self.root.destroy()
 
