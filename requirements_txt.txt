@@ -1,8 +1,0 @@
-pyserial
-pandas
-Pillow
-h5py
-numpy
-matplotlib
-openpyxl
-tkinter
