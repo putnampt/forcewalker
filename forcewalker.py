@@ -17,9 +17,6 @@ import tkinter.messagebox as messagebox
 from collections import deque
 import queue
 import math
-
-# before rebuilding, remove scikit learn and joblib and whatever else for analysis
-
 matplotlib.use('TkAgg')  # Specify the backend before importing pyplot
 import matplotlib.pyplot as plt
 
