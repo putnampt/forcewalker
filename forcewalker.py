@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, simpledialog, messagebox, filedialog
 import serial
 import serial.tools.list_ports
 import threading
@@ -10,645 +10,1608 @@ import h5py
 import numpy as np
 import os
 import sys
-from tkinter import simpledialog
 import matplotlib
 import json
-import tkinter.messagebox as messagebox
 from collections import deque
 import queue
 import math
-matplotlib.use('TkAgg')  # Specify the backend before importing pyplot
+import logging
+import logging.handlers
+from typing import Optional, Tuple, Dict, List, Any
+from dataclasses import dataclass
+from contextlib import contextmanager
+import signal
+import weakref
+
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
 
-class WalkerMonitorApp:
-    def __init__(self, root):
-        self.column_headers = None
-        self.recording_start = None
-        self.root = root
-        self.root.title("Walker Force Monitor")
+@dataclass
+class Config:
+    """Application configuration"""
+    SERIAL_BAUDRATE: int = 57600
+    SERIAL_TIMEOUT: float = 1.0
+    LIVE_PLOT_UPDATE_RATE: int = 50  # ms
+    CALIBRATION_TIME: int = 5  # seconds
+    TARE_TIME: int = 10  # seconds
+    MAX_BUFFER_SIZE: int = 1000
+    DATA_VALIDATION_THRESHOLD: float = 1000000
+    MAX_TREND_CHANGE: float = 1000  # Max change between consecutive readings
+    SERIAL_RECONNECT_DELAY: float = 2.0
+    MAX_RECONNECT_ATTEMPTS: int = 3
+    FILE_SAVE_BATCH_SIZE: int = 1000
+    LOG_MAX_BYTES: int = 10 * 1024 * 1024  # 10MB
+    LOG_BACKUP_COUNT: int = 5
 
-        script_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-        image_path = os.path.join(script_dir, 'app_data', 'splash.png')
 
-        # Load transparent image
-        self.image = Image.open(image_path)  # Change path to your image
-        self.image = self.image.resize((400, 400))
-        self.photo = ImageTk.PhotoImage(self.image)
+class RingBuffer:
+    """Thread-safe ring buffer for efficient memory management"""
 
-        # Create a label to display the image
-        self.image_label = ttk.Label(root, image=self.photo)
-        self.image_label.grid(row=0, column=0, columnspan=3, padx=5, pady=5)
+    def __init__(self, maxlen: int):
+        self.maxlen = maxlen
+        self.data = []
+        self.index = 0
+        self._lock = threading.Lock()
 
-        # Create a StringVar to hold the status text
-        self.status_text = tk.StringVar()
+    def append(self, item):
+        with self._lock:
+            if len(self.data) < self.maxlen:
+                self.data.append(item)
+            else:
+                self.data[self.index] = item
+                self.index = (self.index + 1) % self.maxlen
 
-        # Create a label to display the status text
-        self.status_label = ttk.Label(root, textvariable=self.status_text)
-        self.status_label.grid(row=1, column=0, columnspan=3, padx=5, pady=5)
+    def get_data(self) -> List:
+        with self._lock:
+            if len(self.data) < self.maxlen:
+                return self.data.copy()
+            else:
+                # Return data in correct order
+                return self.data[self.index:] + self.data[:self.index]
 
-        # Initialize status text
-        self.status_text.set("Ready to connect")  # Initial status
+    def clear(self):
+        with self._lock:
+            self.data.clear()
+            self.index = 0
 
-        # Create serial port label
-        self.serial_port_label = ttk.Label(root, text="Select Serial Port:")
-        self.serial_port_label.grid(row=2, column=0, padx=5, pady=5)
+    def __len__(self):
+        with self._lock:
+            return len(self.data)
 
-        # Create serial port combobox
-        self.serial_port_combobox = ttk.Combobox(root, width=20, state="readonly")
-        self.serial_port_combobox.grid(row=2, column=1, padx=5, pady=5)
-        self.serial_port_combobox['values'] = self.list_serial_ports()
 
-        # Create connect button
-        self.connect_button = ttk.Button(root, text="Connect", command=self.connect_serial)
-        self.connect_button.grid(row=2, column=2, padx=5, pady=5)
+class DataValidator:
+    """Enhanced data validation with context awareness"""
 
-        # Create record data button
-        self.record_data_button = ttk.Button(root, text="Record Data", command=self.start_recording, state="disabled")
-        self.record_data_button.grid(row=3, column=0, padx=5, pady=5)
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.last_valid_values: Optional[List[float]] = None
+        self.consecutive_errors = 0
+        self.max_consecutive_errors = 10
 
-        # Create stop recording button
-        self.stop_recording_button = ttk.Button(root, text="Stop Recording", command=self.stop_recording,
-                                                state="disabled")
-        self.stop_recording_button.grid(row=3, column=1, padx=5, pady=5)
-
-        # Create save data button
-        self.save_data_button = ttk.Button(root, text="Save Data", command=self.save_data, state="disabled")
-        self.save_data_button.grid(row=3, column=2, padx=5, pady=5)
-
-        # Create tare button
-        self.tare_button = ttk.Button(root, text="Tare", command=self.tare, state="disabled")
-        self.tare_button.grid(row=4, column=0, padx=5, pady=5)
-
-        # Create calibrate button
-        self.calibrate_button = ttk.Button(root, text="Calibrate", command=self.calibrate, state="disabled")
-        self.calibrate_button.grid(row=4, column=1, padx=5, pady=5)
-
-        # Create view data button
-        self.view_data_button = ttk.Button(root, text="View Data", command=self.view_data, state="disabled")
-        self.view_data_button.grid(row=4, column=2, padx=5, pady=5)
-
-        # Add calibration status button
-        self.cal_status_button = ttk.Button(root, text="Cal Status", command=self.show_calibration_status,
-                                            state="disabled")
-        self.cal_status_button.grid(row=5, column=0, padx=5, pady=5)
-
-        # Add reset calibration button
-        self.reset_cal_button = ttk.Button(root, text="Reset Cal", command=self.reset_calibration, state="disabled")
-        self.reset_cal_button.grid(row=5, column=1, padx=5, pady=5)
-
-        # Create live data button
-        self.live_data_button = ttk.Button(root, text="Live Data", command=self.live_data, state="disabled")
-        self.live_data_button.grid(row=5, column=2, padx=5, pady=5)
-
-        # Create bluetooth button
-        self.bluetooth_button = ttk.Button(root, text="Bluetooth", command=self.connect_bluetooth, state="disabled")
-        self.bluetooth_button.grid(row=6, column=0, padx=5, pady=5)
-
-        self.close_button = ttk.Button(root, text="Close", command=self.close_window)
-        self.close_button.grid(row=6, column=2, padx=5, pady=5)
-
-        # Initialize variables
-        self.serial = None
-        self.bluetooth_connected = False
-        self.is_recording = False
-        self.has_recording = False
-        self.is_reading = False
-        self.is_arduino_starting = False
-        self.is_console_enabled = False
-        self.finished_startup = False
-        self.is_tared = False
-        self.is_calibrated = False
-        self.tare_values = None
-        self.calibration_values = None  # This will be loaded from file if available
-        self.unsaved_data = False
-        self.serial_lock = threading.Lock()
-        self.data = {'rr': [], 'rf': [], 'lr': [], 'lf': []}
-
-        # Live plotting variables
-        self.live_window = None
-        self.live_plot_active = False
-        self.live_data_queue = queue.Queue()
-        self.live_data_buffers = {
-            'rr': deque(maxlen=500),  # Keep last 500 points for smooth plotting
-            'rf': deque(maxlen=500),
-            'lr': deque(maxlen=500),
-            'lf': deque(maxlen=500),
-            'time': deque(maxlen=500)
-        }
-        self.live_start_time = None
-
-        # Try to load previous calibration values when the app starts
-        self.load_calibration_values()
-
-        self.disable_buttons()
-
-    def update_status(self, new_status):  # Update the status text
-        self.status_text.set(new_status)
-
-    def list_serial_ports(self):
-        ports = [port.device for port in serial.tools.list_ports.comports()]
-        return ports
-
-    def disable_buttons(self):
-        self.record_data_button.config(state="disabled")
-        self.stop_recording_button.config(state="disabled")
-        self.save_data_button.config(state="disabled")
-        self.tare_button.config(state="disabled")
-        self.calibrate_button.config(state="disabled")
-        self.view_data_button.config(state="disabled")
-        self.live_data_button.config(state="disabled")
-        self.bluetooth_button.config(state="disabled")
-        self.cal_status_button.config(state="disabled")
-        self.reset_cal_button.config(state="disabled")
-
-    def enable_buttons(self):
-        self.record_data_button.config(state="normal")
-        self.stop_recording_button.config(state="disabled")
-        self.save_data_button.config(state="disabled")
-        self.tare_button.config(state="normal")
-        self.calibrate_button.config(state="normal")
-        self.view_data_button.config(state="disabled")
-        self.connect_button.config(state="disabled")
-        self.serial_port_combobox.config(state="disabled")
-        self.bluetooth_button.config(state="disabled")  # TODO: activate when threading is working
-        self.cal_status_button.config(state="normal")
-        self.reset_cal_button.config(state="normal")
-        self.live_data_button.config(state="normal")
-
-    def connect_serial(self):
-        self.update_status("Connecting..")
-        port = self.serial_port_combobox.get()
-        try:
-            self.serial = serial.Serial(port, 57600, timeout=1)
-            self.is_reading = True
-            self.thread = threading.Thread(target=self.read_serial)
-            self.thread.start()
-            self.update_status("Connected!")
-        except serial.SerialException:
-            self.update_status("Failed to connect to serial port.")
-
-    def auto_tare(self):
-        self.tare_values = [0, 0, 0, 0]
-        self.is_tared = True
-
-    def auto_cal(self):
+    def validate_sensor_data(self, line: str) -> Tuple[bool, Optional[List[float]], str]:
         """
-        Updated auto calibration - load from file if available, otherwise use defaults
-        """
-        # Try to load previous calibration
-        if self.load_calibration_values():
-            # Calibration loaded successfully
-            pass
-        else:
-            # No previous calibration, use defaults
-            self.calibration_values = [1.0, 1.0, 1.0, 1.0]
-            self.tare_values = [0.0, 0.0, 0.0, 0.0]
-            self.is_calibrated = False
-            self.is_tared = False
-
-    def read_serial(self):
-        buffer = ""  # Buffer to accumulate partial data
-
-        while self.is_reading:
-            try:
-                with self.serial_lock:
-                    if self.serial:
-                        # Read available data
-                        if self.serial.in_waiting > 0:
-                            data = self.serial.read(self.serial.in_waiting).decode('utf-8', errors='ignore')
-                            buffer += data
-
-                            # Process complete lines
-                            while '\n' in buffer:
-                                line, buffer = buffer.split('\n', 1)
-                                line = line.strip()
-
-                                if line:
-                                    timestamp = time.time()
-
-                                    if line == "Starting...":
-                                        self.update_status("Starting Arduino")
-                                        self.is_arduino_starting = True
-                                        self.finished_startup = False
-                                        self.disable_buttons()
-                                        continue
-
-                                    if line == "Finished Setup!":
-                                        self.finished_startup = True
-                                        self.is_arduino_starting = False
-                                        self.auto_cal()
-                                        self.auto_tare()
-                                        self.update_status("Ready!")
-                                        self.enable_buttons()
-                                        continue
-
-                                    # Parse sensor data with enhanced validation
-                                    if self.parse_sensor_data(line, timestamp):
-                                        # Data was valid and processed
-                                        pass
-                                    else:
-                                        # Invalid data - already logged in parse_sensor_data
-                                        pass
-
-                        time.sleep(0.001)  # Small delay to prevent busy waiting
-
-                    else:
-                        self.update_status("Serial port is not open. Trying to reconnect...")
-                        self.connect_serial()
-
-            except serial.SerialException as e:
-                print("Serial error:", e)
-                if self.serial and self.serial.is_open:
-                    self.serial.close()
-            except UnicodeDecodeError as e:
-                print(f"Unicode decode error: {e}")
-                buffer = ""  # Clear buffer on decode error
-            except Exception as e:
-                print(f"Unexpected error in read_serial: {e}")
-
-    def parse_sensor_data(self, line, timestamp):
-        """
-        Parse and validate sensor data line
-        Returns True if data was valid and processed, False otherwise
+        Validate sensor data line with comprehensive checks
+        Returns: (is_valid, parsed_values, error_message)
         """
         try:
             # Basic format validation
             if not line or line.count(',') != 3:
-                if self.finished_startup and len(line.strip()) > 0:
-                    print(f"Invalid format (comma count): '{line}'")
-                return False
+                self.consecutive_errors += 1
+                return False, None, f"Invalid format (expected 4 values, got {line.count(',') + 1})"
 
-            # Split and validate each value
-            values = line.split(',')
+            # Parse values
+            values = []
+            raw_values = line.split(',')
 
-            # Check each value is a valid float format
-            parsed_values = []
-            for i, val in enumerate(values):
+            for i, val in enumerate(raw_values):
                 val = val.strip()
 
-                # Check for obviously corrupted data
+                # Check for corrupted data patterns
                 if '..' in val or val.count('.') > 1:
-                    if self.finished_startup:
-                        print(f"Corrupted value detected at position {i}: '{val}' in line '{line}'")
-                    return False
+                    self.consecutive_errors += 1
+                    return False, None, f"Corrupted value at position {i}: '{val}'"
 
-                # Try to parse as float
+                # Parse as float
                 try:
                     parsed_val = float(val)
-
-                    # Sanity check - reject extremely large values (likely corrupted)
-                    if abs(parsed_val) > 1000000:  # Adjust threshold as needed
-                        if self.finished_startup:
-                            print(f"Value too large at position {i}: {parsed_val} in line '{line}'")
-                        return False
-
-                    parsed_values.append(parsed_val)
-
                 except ValueError:
-                    if self.finished_startup:
-                        print(f"Cannot parse value at position {i}: '{val}' in line '{line}'")
-                    return False
+                    self.consecutive_errors += 1
+                    return False, None, f"Cannot parse value at position {i}: '{val}'"
 
-            # If we get here, all values are valid
-            rr, rf, lr, lf = parsed_values
+                # Range validation
+                if abs(parsed_val) > Config.DATA_VALIDATION_THRESHOLD:
+                    self.consecutive_errors += 1
+                    return False, None, f"Value too large at position {i}: {parsed_val}"
 
-            if self.is_console_enabled:
-                print("RR:", rr, "RF:", rf, "LR:", lr, "LF:", lf)
+                values.append(parsed_val)
 
-            # Apply tare and calibration
-            if self.is_tared:
-                rr -= self.tare_values[0]
-                rf -= self.tare_values[1]
-                lr -= self.tare_values[2]
-                lf -= self.tare_values[3]
+            # Trend validation (detect unrealistic jumps)
+            if self.last_valid_values and not self._validate_trend(values):
+                self.consecutive_errors += 1
+                return False, None, "Unrealistic data trend detected"
 
-                if self.is_calibrated:
-                    rr /= self.calibration_values[0]
-                    rf /= self.calibration_values[1]
-                    lr /= self.calibration_values[2]
-                    lf /= self.calibration_values[3]
+            # Check if we have too many consecutive errors
+            if self.consecutive_errors > self.max_consecutive_errors:
+                self.logger.warning(f"Too many consecutive validation errors ({self.consecutive_errors})")
 
-            # Store data if recording
-            if self.is_recording:
-                timestamp -= self.recording_start
-                self.data['rr'].append((timestamp, rr))
-                self.data['rf'].append((timestamp, rf))
-                self.data['lr'].append((timestamp, lr))
-                self.data['lf'].append((timestamp, lf))
-
-            # Add to live plot queue if live plotting is active
-            if self.live_plot_active:
-                try:
-                    self.live_data_queue.put_nowait((timestamp, rr, rf, lr, lf))
-                except queue.Full:
-                    # Queue is full, skip this data point
-                    pass
-
-            return True
+            # Success - reset error counter and update last valid values
+            self.consecutive_errors = 0
+            self.last_valid_values = values
+            return True, values, "Valid"
 
         except Exception as e:
-            if self.finished_startup:
-                print(f"Error parsing sensor data '{line}': {e}")
+            self.consecutive_errors += 1
+            self.logger.error(f"Unexpected error in data validation: {e}")
+            return False, None, f"Validation error: {e}"
+
+    def _validate_trend(self, values: List[float]) -> bool:
+        """Check for unrealistic jumps in sensor readings"""
+        if not self.last_valid_values:
+            return True
+
+        for new_val, old_val in zip(values, self.last_valid_values):
+            if abs(new_val - old_val) > Config.MAX_TREND_CHANGE:
+                return False
+        return True
+
+    def reset(self):
+        """Reset validation state"""
+        self.last_valid_values = None
+        self.consecutive_errors = 0
+
+
+class ProgressDialog:
+    """Thread-safe progress dialog for long operations"""
+
+    def __init__(self, parent, title: str, max_time: float):
+        self.parent = parent
+        self.title = title
+        self.max_time = max_time
+        self.dialog = None
+        self.progress = None
+        self.label = None
+        self.cancelled = False
+        self._create_dialog()
+
+    def _create_dialog(self):
+        if self.parent:
+            self.dialog = tk.Toplevel(self.parent)
+            self.dialog.title(self.title)
+            self.dialog.geometry("400x150")
+            self.dialog.resizable(False, False)
+
+            # Center on parent
+            self.dialog.transient(self.parent)
+            self.dialog.grab_set()
+
+            # Progress bar
+            self.progress = ttk.Progressbar(
+                self.dialog,
+                mode='determinate',
+                maximum=100
+            )
+            self.progress.pack(pady=20, padx=20, fill=tk.X)
+
+            # Status label
+            self.label = ttk.Label(self.dialog, text="Starting...")
+            self.label.pack(pady=5)
+
+            # Cancel button
+            cancel_btn = ttk.Button(
+                self.dialog,
+                text="Cancel",
+                command=self._cancel
+            )
+            cancel_btn.pack(pady=10)
+
+            self.dialog.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def update(self, progress_percent: float, message: str):
+        """Update progress dialog from any thread"""
+        if self.dialog and not self.cancelled:
+            def _update():
+                try:
+                    if self.progress:
+                        self.progress['value'] = progress_percent
+                    if self.label:
+                        self.label.config(text=message)
+                    self.dialog.update()
+                except tk.TclError:
+                    # Dialog was destroyed
+                    pass
+
+            if self.parent:
+                self.parent.after(0, _update)
+
+    def _cancel(self):
+        self.cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self.cancelled
+
+    def close(self):
+        if self.dialog:
+            try:
+                self.dialog.destroy()
+            except tk.TclError:
+                pass
+            finally:
+                self.dialog = None
+
+
+class SafeThread(threading.Thread):
+    """Enhanced thread with proper cleanup and error handling"""
+
+    def __init__(self, target, args=(), kwargs=None, logger=None):
+        super().__init__(target=target, args=args, kwargs=kwargs or {})
+        self.daemon = True
+        self._stop_event = threading.Event()
+        self.logger = logger or logging.getLogger(__name__)
+        self._exception = None
+
+    def run(self):
+        try:
+            super().run()
+        except Exception as e:
+            self.logger.error(f"Thread {self.name} failed: {e}", exc_info=True)
+            self._exception = e
+
+    def stop(self):
+        self._stop_event.set()
+
+    def stopped(self) -> bool:
+        return self._stop_event.is_set()
+
+    def join_with_timeout(self, timeout: float) -> bool:
+        """Join with timeout, return True if thread finished"""
+        self.join(timeout=timeout)
+        return not self.is_alive()
+
+    def get_exception(self):
+        return self._exception
+
+
+class SerialHandler:
+    """Robust serial communication handler"""
+
+    def __init__(self, logger: logging.Logger, data_callback=None, status_callback=None):
+        self.logger = logger
+        self.data_callback = data_callback
+        self.status_callback = status_callback
+        self.serial: Optional[serial.Serial] = None
+        self.is_connected = False
+        self.is_reading = False
+        self._read_thread: Optional[SafeThread] = None
+        self._lock = threading.RLock()
+        self.reconnect_attempts = 0
+        self.validator = DataValidator(logger)
+
+    @contextmanager
+    def _serial_operation(self):
+        """Context manager for safe serial operations"""
+        try:
+            with self._lock:
+                if not self.serial or not self.serial.is_open:
+                    raise serial.SerialException("Serial port not open")
+                yield self.serial
+        except serial.SerialException as e:
+            self.logger.error(f"Serial operation failed: {e}")
+            self._handle_disconnect()
+            raise
+        except Exception as e:
+            self.logger.error(f"Unexpected serial error: {e}")
+            raise
+
+    def connect(self, port: str) -> bool:
+        """Connect to serial port with error handling"""
+        try:
+            with self._lock:
+                if self.is_connected:
+                    self.disconnect()
+
+                self.logger.info(f"Attempting to connect to {port}")
+                self.serial = serial.Serial(
+                    port,
+                    Config.SERIAL_BAUDRATE,
+                    timeout=Config.SERIAL_TIMEOUT
+                )
+
+                self.is_connected = True
+                self.reconnect_attempts = 0
+                self.validator.reset()
+
+                # Start reading thread
+                self.is_reading = True
+                self._read_thread = SafeThread(
+                    target=self._read_loop,
+                    logger=self.logger
+                )
+                self._read_thread.start()
+
+                self.logger.info(f"Successfully connected to {port}")
+                if self.status_callback:
+                    self.status_callback("Connected!")
+                return True
+
+        except serial.SerialException as e:
+            self.logger.error(f"Failed to connect to {port}: {e}")
+            if self.status_callback:
+                self.status_callback(f"Connection failed: {e}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Unexpected error connecting to {port}: {e}")
+            if self.status_callback:
+                self.status_callback(f"Connection error: {e}")
             return False
 
-    def reset_data(self):
-        # Resetting the lists for rr, rf, lr, and lf
-        self.data['rr'] = []
-        self.data['rf'] = []
-        self.data['lr'] = []
-        self.data['lf'] = []
+    def disconnect(self):
+        """Safely disconnect from serial port"""
+        try:
+            with self._lock:
+                self.is_reading = False
 
-    def connect_bluetooth(self):
-        pass  # TODO reactive once working
+                # Stop reading thread
+                if self._read_thread and self._read_thread.is_alive():
+                    self._read_thread.stop()
+                    if not self._read_thread.join_with_timeout(2.0):
+                        self.logger.warning("Read thread did not stop gracefully")
+
+                # Close serial port
+                if self.serial and self.serial.is_open:
+                    self.serial.close()
+                    self.logger.info("Serial port closed")
+
+                self.is_connected = False
+                if self.status_callback:
+                    self.status_callback("Disconnected")
+
+        except Exception as e:
+            self.logger.error(f"Error during disconnect: {e}")
+
+    def _read_loop(self):
+        """Main serial reading loop with robust error handling"""
+        buffer = ""
+
+        while self.is_reading and not threading.current_thread().stopped():
+            try:
+                with self._serial_operation() as ser:
+                    if ser.in_waiting > 0:
+                        data = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+                        buffer += data
+
+                        # Process complete lines
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
+                            line = line.strip()
+
+                            if line:
+                                self._process_line(line)
+
+                time.sleep(0.001)  # Small delay to prevent busy waiting
+
+            except serial.SerialException:
+                # Connection lost, attempt reconnect
+                self._attempt_reconnect()
+                break
+            except UnicodeDecodeError as e:
+                self.logger.warning(f"Unicode decode error: {e}")
+                buffer = ""  # Clear buffer on decode error
+            except Exception as e:
+                self.logger.error(f"Unexpected error in read loop: {e}")
+                time.sleep(0.1)  # Back off on unexpected errors
+
+    def _process_line(self, line: str):
+        """Process a complete line of data"""
+        timestamp = time.time()
+
+        # Handle special messages
+        if line == "Starting...":
+            if self.status_callback:
+                self.status_callback("Arduino starting...")
+            return
+        elif line == "Finished Setup!":
+            if self.status_callback:
+                self.status_callback("Arduino ready!")
+            return
+
+        # Validate and parse sensor data
+        is_valid, values, error_msg = self.validator.validate_sensor_data(line)
+
+        if is_valid and values and self.data_callback:
+            self.data_callback(timestamp, values)
+        elif not is_valid:
+            self.logger.debug(f"Invalid data: {error_msg} - Line: '{line}'")
+
+    def _handle_disconnect(self):
+        """Handle unexpected disconnection"""
+        self.is_connected = False
+        if self.status_callback:
+            self.status_callback("Connection lost")
+        self.logger.warning("Serial connection lost")
+
+    def _attempt_reconnect(self):
+        """Attempt to reconnect to serial port"""
+        if self.reconnect_attempts >= Config.MAX_RECONNECT_ATTEMPTS:
+            self.logger.error("Max reconnection attempts reached")
+            return
+
+        self.reconnect_attempts += 1
+        self.logger.info(f"Attempting reconnection #{self.reconnect_attempts}")
+
+        if self.status_callback:
+            self.status_callback(f"Reconnecting... ({self.reconnect_attempts}/{Config.MAX_RECONNECT_ATTEMPTS})")
+
+        time.sleep(Config.SERIAL_RECONNECT_DELAY)
+
+        # Try to reconnect (this would need the original port info)
+        # For now, just mark as disconnected
+        self._handle_disconnect()
+
+
+class DataProcessor:
+    """Handle data processing, calibration, and storage"""
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.data = {'rr': [], 'rf': [], 'lr': [], 'lf': []}
+        self.tare_values: Optional[List[float]] = None
+        self.calibration_values: Optional[List[float]] = None
+        self.is_tared = False
+        self.is_calibrated = False
+        self.is_recording = False
+        self.recording_start: Optional[float] = None
+        self._lock = threading.RLock()
+
+        # Live data management
+        self.live_data_buffers = {
+            'rr': RingBuffer(Config.MAX_BUFFER_SIZE),
+            'rf': RingBuffer(Config.MAX_BUFFER_SIZE),
+            'lr': RingBuffer(Config.MAX_BUFFER_SIZE),
+            'lf': RingBuffer(Config.MAX_BUFFER_SIZE),
+            'time': RingBuffer(Config.MAX_BUFFER_SIZE)
+        }
+        self.live_data_queue = queue.Queue(maxsize=1000)
+
+    def add_data_point(self, timestamp: float, raw_values: List[float]):
+        """Add a new data point with processing"""
+        try:
+            with self._lock:
+                # Apply tare and calibration
+                processed_values = self._apply_processing(raw_values)
+
+                # Store for recording if active
+                if self.is_recording and self.recording_start:
+                    relative_time = timestamp - self.recording_start
+                    self.data['rr'].append((relative_time, processed_values[0]))
+                    self.data['rf'].append((relative_time, processed_values[1]))
+                    self.data['lr'].append((relative_time, processed_values[2]))
+                    self.data['lf'].append((relative_time, processed_values[3]))
+
+                # Add to live buffers
+                self.live_data_buffers['time'].append(timestamp)
+                for i, sensor in enumerate(['rr', 'rf', 'lr', 'lf']):
+                    self.live_data_buffers[sensor].append(processed_values[i])
+
+                # Add to live plot queue (non-blocking)
+                try:
+                    self.live_data_queue.put_nowait((timestamp, *processed_values))
+                except queue.Full:
+                    # Queue is full, drop oldest data
+                    try:
+                        self.live_data_queue.get_nowait()
+                        self.live_data_queue.put_nowait((timestamp, *processed_values))
+                    except queue.Empty:
+                        pass
+
+        except Exception as e:
+            self.logger.error(f"Error processing data point: {e}")
+
+    def _apply_processing(self, raw_values: List[float]) -> List[float]:
+        """Apply tare and calibration to raw values"""
+        processed = raw_values.copy()
+
+        # Apply tare
+        if self.is_tared and self.tare_values:
+            for i in range(4):
+                processed[i] -= self.tare_values[i]
+
+        # Apply calibration
+        if self.is_calibrated and self.calibration_values:
+            for i in range(4):
+                if self.calibration_values[i] != 0:
+                    processed[i] /= self.calibration_values[i]
+
+        return processed
 
     def start_recording(self):
-        self.reset_data()
-        self.is_recording = True
-        self.record_data_button.config(state="disabled")
-        self.stop_recording_button.config(state="normal")
-        self.calibrate_button.config(state="disabled")
-        self.tare_button.config(state="disabled")
-        self.save_data_button.config(state="disabled")
-        self.view_data_button.config(state="disabled")
-        self.update_status("Recording")
-        self.unsaved_data = True
-        # Capture the starting timestamp
-        self.recording_start = time.time()
+        """Start data recording"""
+        with self._lock:
+            self.data = {'rr': [], 'rf': [], 'lr': [], 'lf': []}
+            self.is_recording = True
+            self.recording_start = time.time()
+            self.logger.info("Recording started")
 
     def stop_recording(self):
-        self.is_recording = False
-        self.has_recording = True
-        self.stop_recording_button.config(state="disabled")
-        self.record_data_button.config(state="normal")
-        self.save_data_button.config(state="normal")
-        self.calibrate_button.config(state="normal")
-        self.tare_button.config(state="normal")
-        self.save_data_button.config(state="normal")
-        self.view_data_button.config(state="normal")
-        self.update_status("Ready")
+        """Stop data recording"""
+        with self._lock:
+            self.is_recording = False
+            self.logger.info(f"Recording stopped. Collected {len(self.data['rr'])} data points")
 
-    def close_window(self):
-        self.update_status("Closing down...")
-        if self.unsaved_data:
-            if tk.messagebox.askyesno("Unsaved Data", "There is unsaved data. Do you want to save before closing?"):
-                self.save_data()
+    def has_data(self) -> bool:
+        """Check if we have recorded data"""
+        with self._lock:
+            return bool(self.data['rr'])
 
-        # Close live plot window if open
-        if self.live_plot_active:
-            self.close_live_plot()
+    def clear_live_data(self):
+        """Clear live data buffers"""
+        for buffer in self.live_data_buffers.values():
+            buffer.clear()
 
-        if self.serial and self.serial.is_open:
-            self.serial.close()
+        # Clear queue
+        while not self.live_data_queue.empty():
+            try:
+                self.live_data_queue.get_nowait()
+            except queue.Empty:
+                break
 
-        self.root.destroy()
+    def set_tare(self, values: List[float]):
+        """Set tare values"""
+        with self._lock:
+            self.tare_values = values.copy()
+            self.is_tared = True
+            self.logger.info(f"Tare values set: {values}")
 
-    def get_data_folder_path(self):
-        """
-        Get the path to the Data folder, works for both script and exe
-        """
-        # Get the directory where the script/exe is located
+    def set_calibration(self, values: List[float]):
+        """Set calibration values"""
+        with self._lock:
+            self.calibration_values = values.copy()
+            self.is_calibrated = True
+            self.logger.info(f"Calibration values set: {values}")
+
+    def get_live_data_queue(self) -> queue.Queue:
+        """Get live data queue for plotting"""
+        return self.live_data_queue
+
+    def get_recording_data(self) -> Dict:
+        """Get recorded data (thread-safe copy)"""
+        with self._lock:
+            return {
+                'rr': self.data['rr'].copy(),
+                'rf': self.data['rf'].copy(),
+                'lr': self.data['lr'].copy(),
+                'lf': self.data['lf'].copy()
+            }
+
+
+class FileManager:
+    """Handle file operations with error handling"""
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.data_folder = self._get_data_folder_path()
+
+    def _get_data_folder_path(self) -> str:
+        """Get the path to the Data folder"""
         if getattr(sys, 'frozen', False):
-            # Running as exe
             base_dir = os.path.dirname(sys.executable)
         else:
-            # Running as script
             base_dir = os.path.dirname(os.path.abspath(__file__))
 
         data_folder = os.path.join(base_dir, 'Data')
 
-        # Create the Data folder if it doesn't exist
-        if not os.path.exists(data_folder):
-            os.makedirs(data_folder)
+        try:
+            if not os.path.exists(data_folder):
+                os.makedirs(data_folder)
+                self.logger.info(f"Created data folder: {data_folder}")
+        except Exception as e:
+            self.logger.error(f"Failed to create data folder: {e}")
+            # Fallback to current directory
+            data_folder = os.getcwd()
 
         return data_folder
 
-    def save_data(self):
-        self.update_status("Saving data...")
-        if self.has_recording:
-            if self.data['rr'] and self.data['rf'] and self.data['lr'] and self.data['lf']:
-                # Use the new data folder path method
-                data_folder = self.get_data_folder_path()
+    def save_data(self, data: Dict, progress_callback=None) -> Tuple[bool, str]:
+        """Save data in multiple formats with progress reporting"""
+        try:
+            if not any(data.values()):
+                return False, "No data to save"
 
-                # Generate base filename with timestamp
-                base_filename = f"FW_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+            base_filename = f"FW_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
 
-                # 1. Save H5 format (existing code)
-                hd_filename = os.path.join(data_folder, f"{base_filename}.h5")
-                with h5py.File(hd_filename, 'w') as f:
-                    f.create_dataset('rr', data=np.array(self.data['rr']))
-                    f.create_dataset('rf', data=np.array(self.data['rf']))
-                    f.create_dataset('lr', data=np.array(self.data['lr']))
-                    f.create_dataset('lf', data=np.array(self.data['lf']))
-                print(f"H5 Data saved to {hd_filename}")
+            # Update progress
+            if progress_callback:
+                progress_callback(10, "Preparing data...")
 
-                # Create DataFrames for each sensor
-                df_rr = pd.DataFrame(self.data['rr'], columns=['Timestamp', 'Right-Rear'])
-                df_rf = pd.DataFrame(self.data['rf'], columns=['Timestamp', 'Right-Front'])
-                df_lr = pd.DataFrame(self.data['lr'], columns=['Timestamp', 'Left-Rear'])
-                df_lf = pd.DataFrame(self.data['lf'], columns=['Timestamp', 'Left-Front'])
+            # Create DataFrames
+            df_data = {}
+            sensor_names = {'rr': 'Right-Rear', 'rf': 'Right-Front',
+                            'lr': 'Left-Rear', 'lf': 'Left-Front'}
 
-                # 2. Save to Excel XLSX format (existing code)
-                excel_filename = os.path.join(data_folder, f"{base_filename}.xlsx")
-                with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
-                    df_rr.to_excel(writer, sheet_name='RR', index=False)
-                    df_rf.to_excel(writer, sheet_name='RF', index=False)
-                    df_lr.to_excel(writer, sheet_name='LR', index=False)
-                    df_lf.to_excel(writer, sheet_name='LF', index=False)
-                print(f"Excel XLSX Data saved to {excel_filename}")
+            for sensor, name in sensor_names.items():
+                if data[sensor]:
+                    df_data[sensor] = pd.DataFrame(data[sensor], columns=['Timestamp', name])
+                else:
+                    df_data[sensor] = pd.DataFrame(columns=['Timestamp', name])
 
-                # 3. Save to Excel XLS format (legacy Excel format)
-                try:
-                    xls_filename = os.path.join(data_folder, f"{base_filename}.xls")
-                    with pd.ExcelWriter(xls_filename, engine='xlwt') as writer:
-                        df_rr.to_excel(writer, sheet_name='RR', index=False)
-                        df_rf.to_excel(writer, sheet_name='RF', index=False)
-                        df_lr.to_excel(writer, sheet_name='LR', index=False)
-                        df_lf.to_excel(writer, sheet_name='LF', index=False)
-                    print(f"Excel XLS Data saved to {xls_filename}")
-                except Exception as e:
-                    print(f"Warning: Could not save XLS format - {e}")
-                    print("Note: You may need to install xlwt: pip install xlwt")
+            success_files = []
+            total_formats = 5  # H5, XLSX, XLS, CSV combined, CSV individual
 
-                # 4. Save to CSV format - Combined file with all sensors
-                csv_filename = os.path.join(data_folder, f"{base_filename}_combined.csv")
+            # 1. Save H5 format
+            if progress_callback:
+                progress_callback(20, "Saving H5 format...")
 
-                # Create a combined DataFrame with all sensors
-                # Find the maximum length to handle potential different lengths
-                max_length = max(len(self.data['rr']), len(self.data['rf']),
-                                 len(self.data['lr']), len(self.data['lf']))
+            if self._save_h5(base_filename, data):
+                success_files.append("H5")
 
-                # Create lists for combined data
-                combined_data = []
+            # 2. Save XLSX format
+            if progress_callback:
+                progress_callback(40, "Saving XLSX format...")
 
-                # Combine all data points by timestamp
-                all_timestamps = set()
-                for sensor_data in [self.data['rr'], self.data['rf'], self.data['lr'], self.data['lf']]:
-                    for timestamp, _ in sensor_data:
-                        all_timestamps.add(timestamp)
+            if self._save_xlsx(base_filename, df_data):
+                success_files.append("XLSX")
 
-                # Sort timestamps
-                sorted_timestamps = sorted(all_timestamps)
+            # 3. Save XLS format
+            if progress_callback:
+                progress_callback(60, "Saving XLS format...")
 
-                # Create dictionaries for quick lookup
-                rr_dict = {t: v for t, v in self.data['rr']}
-                rf_dict = {t: v for t, v in self.data['rf']}
-                lr_dict = {t: v for t, v in self.data['lr']}
-                lf_dict = {t: v for t, v in self.data['lf']}
+            if self._save_xls(base_filename, df_data):
+                success_files.append("XLS")
 
-                # Build combined dataset
-                for timestamp in sorted_timestamps:
-                    row = {
-                        'Timestamp': timestamp,
-                        'Right-Rear': rr_dict.get(timestamp, ''),
-                        'Right-Front': rf_dict.get(timestamp, ''),
-                        'Left-Rear': lr_dict.get(timestamp, ''),
-                        'Left-Front': lf_dict.get(timestamp, '')
-                    }
-                    combined_data.append(row)
+            # 4. Save combined CSV
+            if progress_callback:
+                progress_callback(80, "Saving CSV formats...")
 
-                # Create DataFrame and save
-                df_combined = pd.DataFrame(combined_data)
-                df_combined.to_csv(csv_filename, index=False, float_format='%.6f')
-                print(f"Combined CSV Data saved to {csv_filename}")
+            if self._save_csv_combined(base_filename, data):
+                success_files.append("CSV combined")
 
-                # 5. Save individual CSV files for each sensor (optional)
-                csv_rr_filename = os.path.join(data_folder, f"{base_filename}_RR.csv")
-                csv_rf_filename = os.path.join(data_folder, f"{base_filename}_RF.csv")
-                csv_lr_filename = os.path.join(data_folder, f"{base_filename}_LR.csv")
-                csv_lf_filename = os.path.join(data_folder, f"{base_filename}_LF.csv")
+            # 5. Save individual CSVs
+            if self._save_csv_individual(base_filename, df_data):
+                success_files.append("CSV individual")
 
-                df_rr.to_csv(csv_rr_filename, index=False, float_format='%.6f')
-                df_rf.to_csv(csv_rf_filename, index=False, float_format='%.6f')
-                df_lr.to_csv(csv_lr_filename, index=False, float_format='%.6f')
-                df_lf.to_csv(csv_lf_filename, index=False, float_format='%.6f')
+            if progress_callback:
+                progress_callback(100, "Save complete!")
 
-                print(f"Individual CSV files saved:")
-                print(f"  - {csv_rr_filename}")
-                print(f"  - {csv_rf_filename}")
-                print(f"  - {csv_lr_filename}")
-                print(f"  - {csv_lf_filename}")
+            if success_files:
+                message = f"Data saved successfully in formats: {', '.join(success_files)}"
+                self.logger.info(message)
+                return True, message
+            else:
+                message = "Failed to save data in any format"
+                self.logger.error(message)
+                return False, message
 
-                self.update_status("Data Saved in all formats!")
-                self.unsaved_data = False
-        else:
-            self.update_status("No Recording found in memory!")
+        except Exception as e:
+            error_msg = f"Error saving data: {e}"
+            self.logger.error(error_msg, exc_info=True)
+            return False, error_msg
 
-    def view_data(self):
-        if self.has_recording:
+    def _save_h5(self, base_filename: str, data: Dict) -> bool:
+        """Save data in H5 format"""
+        try:
+            filename = os.path.join(self.data_folder, f"{base_filename}.h5")
+            with h5py.File(filename, 'w') as f:
+                for sensor in ['rr', 'rf', 'lr', 'lf']:
+                    if data[sensor]:
+                        f.create_dataset(sensor, data=np.array(data[sensor]))
+            self.logger.info(f"H5 data saved to {filename}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to save H5: {e}")
+            return False
 
-            # Plotting rr, rf, lr, and lf over time
-            plt.figure(figsize=(10, 6))
-            plt.plot([data[0] for data in self.data['rr']], [data[1] for data in self.data['rr']], label='Right-Rear')
-            plt.plot([data[0] for data in self.data['rf']], [data[1] for data in self.data['rf']], label='Right-Front')
-            plt.plot([data[0] for data in self.data['lr']], [data[1] for data in self.data['lr']], label='Left-Rear')
-            plt.plot([data[0] for data in self.data['lf']], [data[1] for data in self.data['lf']], label='Left-Front')
-            plt.xlabel('Time (seconds)')
-            plt.ylabel('Force (grams)')
-            plt.title('Force Data Over Time')
-            plt.legend()
-            plt.show()
-        else:
-            self.update_status("No Recording found in memory!")
+    def _save_xlsx(self, base_filename: str, df_data: Dict) -> bool:
+        """Save data in XLSX format"""
+        try:
+            filename = os.path.join(self.data_folder, f"{base_filename}.xlsx")
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                for sensor, df in df_data.items():
+                    df.to_excel(writer, sheet_name=sensor.upper(), index=False)
+            self.logger.info(f"XLSX data saved to {filename}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to save XLSX: {e}")
+            return False
 
-    def live_data(self):
-        """Open live data plotting window using tkinter Canvas"""
-        if self.live_plot_active and self.live_window and self.live_window.winfo_exists():
-            # Window already open, bring to front
-            self.live_window.lift()
+    def _save_xls(self, base_filename: str, df_data: Dict) -> bool:
+        """Save data in XLS format"""
+        try:
+            filename = os.path.join(self.data_folder, f"{base_filename}.xls")
+            with pd.ExcelWriter(filename, engine='xlwt') as writer:
+                for sensor, df in df_data.items():
+                    df.to_excel(writer, sheet_name=sensor.upper(), index=False)
+            self.logger.info(f"XLS data saved to {filename}")
+            return True
+        except ImportError:
+            self.logger.warning("xlwt not available, skipping XLS format")
+            return False
+        except Exception as e:
+            self.logger.error(f"Failed to save XLS: {e}")
+            return False
+
+    def _save_csv_combined(self, base_filename: str, data: Dict) -> bool:
+        """Save combined CSV file"""
+        try:
+            filename = os.path.join(self.data_folder, f"{base_filename}_combined.csv")
+
+            # Get all timestamps
+            all_timestamps = set()
+            for sensor_data in data.values():
+                for timestamp, _ in sensor_data:
+                    all_timestamps.add(timestamp)
+
+            if not all_timestamps:
+                return False
+
+            # Create combined dataset
+            sorted_timestamps = sorted(all_timestamps)
+            sensor_dicts = {
+                sensor: {t: v for t, v in sensor_data}
+                for sensor, sensor_data in data.items()
+            }
+
+            combined_data = []
+            sensor_names = {'rr': 'Right-Rear', 'rf': 'Right-Front',
+                            'lr': 'Left-Rear', 'lf': 'Left-Front'}
+
+            for timestamp in sorted_timestamps:
+                row = {'Timestamp': timestamp}
+                for sensor, name in sensor_names.items():
+                    row[name] = sensor_dicts[sensor].get(timestamp, '')
+                combined_data.append(row)
+
+            df_combined = pd.DataFrame(combined_data)
+            df_combined.to_csv(filename, index=False, float_format='%.6f')
+            self.logger.info(f"Combined CSV saved to {filename}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to save combined CSV: {e}")
+            return False
+
+    def _save_csv_individual(self, base_filename: str, df_data: Dict) -> bool:
+        """Save individual CSV files"""
+        try:
+            for sensor, df in df_data.items():
+                filename = os.path.join(self.data_folder, f"{base_filename}_{sensor.upper()}.csv")
+                df.to_csv(filename, index=False, float_format='%.6f')
+            self.logger.info("Individual CSV files saved")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to save individual CSVs: {e}")
+            return False
+
+    def load_calibration(self) -> Tuple[bool, Dict]:
+        """Load calibration data from file"""
+        try:
+            cal_file = os.path.join(self.data_folder, 'calibration.json')
+            if os.path.exists(cal_file):
+                with open(cal_file, 'r') as f:
+                    cal_data = json.load(f)
+                self.logger.info("Calibration data loaded successfully")
+                return True, cal_data
+            else:
+                return False, {}
+        except Exception as e:
+            self.logger.error(f"Failed to load calibration: {e}")
+            return False, {}
+
+    def save_calibration(self, cal_data: Dict) -> bool:
+        """Save calibration data to file"""
+        try:
+            cal_file = os.path.join(self.data_folder, 'calibration.json')
+            with open(cal_file, 'w') as f:
+                json.dump(cal_data, f, indent=2)
+            self.logger.info("Calibration data saved successfully")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to save calibration: {e}")
+            return False
+
+
+class WalkerMonitorApp:
+    """Main application class with improved architecture"""
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Walker Force Monitor v2.0")
+
+        # Set up logging first
+        self.logger = self._setup_logging()
+        self.logger.info("Application starting...")
+
+        # Initialize components
+        self.data_processor = DataProcessor(self.logger)
+        self.file_manager = FileManager(self.logger)
+        self.serial_handler = SerialHandler(
+            self.logger,
+            data_callback=self.data_processor.add_data_point,
+            status_callback=self._update_status
+        )
+
+        # UI state
+        self.status_text = tk.StringVar()
+        self.current_progress_dialog: Optional[ProgressDialog] = None
+        self.live_window = None
+        self.live_plot_active = False
+
+        # Application state
+        self.unsaved_data = False
+        self.startup_complete = False
+
+        # Set up UI
+        self._setup_ui()
+
+        # Load previous calibration
+        self._load_previous_calibration()
+
+        # Set up cleanup
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+        signal.signal(signal.SIGINT, self._signal_handler)
+
+        self.logger.info("Application initialized successfully")
+
+    def _setup_logging(self) -> logging.Logger:
+        """Set up comprehensive logging"""
+        logger = logging.getLogger('WalkerMonitor')
+        logger.setLevel(logging.INFO)
+
+        # Clear any existing handlers
+        logger.handlers.clear()
+
+        # Create formatter
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+
+        # File handler with rotation
+        try:
+            log_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                'walker_monitor.log'
+            )
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file,
+                maxBytes=Config.LOG_MAX_BYTES,
+                backupCount=Config.LOG_BACKUP_COUNT
+            )
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except Exception as e:
+            print(f"Failed to set up file logging: {e}")
+
+        # Console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        return logger
+
+    def _setup_ui(self):
+        """Set up the user interface"""
+        try:
+            # Load and display splash image
+            self._setup_splash_image()
+
+            # Status display
+            self.status_label = ttk.Label(self.root, textvariable=self.status_text)
+            self.status_label.grid(row=1, column=0, columnspan=3, padx=5, pady=5)
+            self.status_text.set("Ready to connect")
+
+            # Serial connection controls
+            self._setup_serial_controls()
+
+            # Recording controls
+            self._setup_recording_controls()
+
+            # Calibration controls
+            self._setup_calibration_controls()
+
+            # Additional controls
+            self._setup_additional_controls()
+
+            # Initially disable most buttons
+            self._disable_buttons()
+
+        except Exception as e:
+            self.logger.error(f"Failed to setup UI: {e}")
+            messagebox.showerror("UI Error", f"Failed to initialize interface: {e}")
+
+    def _setup_splash_image(self):
+        """Load and display splash image with error handling"""
+        try:
+            script_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+            image_path = os.path.join(script_dir, 'app_data', 'splash.png')
+
+            if os.path.exists(image_path):
+                self.image = Image.open(image_path)
+                self.image = self.image.resize((400, 400))
+                self.photo = ImageTk.PhotoImage(self.image)
+
+                self.image_label = ttk.Label(self.root, image=self.photo)
+                self.image_label.grid(row=0, column=0, columnspan=3, padx=5, pady=5)
+            else:
+                # No image available, create placeholder
+                self.image_label = ttk.Label(self.root, text="Walker Force Monitor",
+                                             font=("Arial", 16, "bold"))
+                self.image_label.grid(row=0, column=0, columnspan=3, padx=5, pady=20)
+
+        except Exception as e:
+            self.logger.warning(f"Failed to load splash image: {e}")
+            # Create text placeholder instead
+            self.image_label = ttk.Label(self.root, text="Walker Force Monitor",
+                                         font=("Arial", 16, "bold"))
+            self.image_label.grid(row=0, column=0, columnspan=3, padx=5, pady=20)
+
+    def _setup_serial_controls(self):
+        """Set up serial connection controls"""
+        # Serial port selection
+        ttk.Label(self.root, text="Select Serial Port:").grid(row=2, column=0, padx=5, pady=5)
+
+        self.serial_port_combobox = ttk.Combobox(self.root, width=20, state="readonly")
+        self.serial_port_combobox.grid(row=2, column=1, padx=5, pady=5)
+        self._refresh_serial_ports()
+
+        self.connect_button = ttk.Button(self.root, text="Connect", command=self._connect_serial)
+        self.connect_button.grid(row=2, column=2, padx=5, pady=5)
+
+        # Refresh ports button
+        refresh_button = ttk.Button(self.root, text="Refresh", command=self._refresh_serial_ports)
+        refresh_button.grid(row=2, column=3, padx=5, pady=5)
+
+    def _setup_recording_controls(self):
+        """Set up recording controls"""
+        self.record_button = ttk.Button(self.root, text="Record Data",
+                                        command=self._start_recording, state="disabled")
+        self.record_button.grid(row=3, column=0, padx=5, pady=5)
+
+        self.stop_button = ttk.Button(self.root, text="Stop Recording",
+                                      command=self._stop_recording, state="disabled")
+        self.stop_button.grid(row=3, column=1, padx=5, pady=5)
+
+        self.save_button = ttk.Button(self.root, text="Save Data",
+                                      command=self._save_data, state="disabled")
+        self.save_button.grid(row=3, column=2, padx=5, pady=5)
+
+    def _setup_calibration_controls(self):
+        """Set up calibration controls"""
+        self.tare_button = ttk.Button(self.root, text="Tare",
+                                      command=self._tare, state="disabled")
+        self.tare_button.grid(row=4, column=0, padx=5, pady=5)
+
+        self.calibrate_button = ttk.Button(self.root, text="Calibrate",
+                                           command=self._calibrate, state="disabled")
+        self.calibrate_button.grid(row=4, column=1, padx=5, pady=5)
+
+        self.cal_status_button = ttk.Button(self.root, text="Cal Status",
+                                            command=self._show_calibration_status, state="disabled")
+        self.cal_status_button.grid(row=4, column=2, padx=5, pady=5)
+
+    def _setup_additional_controls(self):
+        """Set up additional controls"""
+        self.view_button = ttk.Button(self.root, text="View Data",
+                                      command=self._view_data, state="disabled")
+        self.view_button.grid(row=5, column=0, padx=5, pady=5)
+
+        self.live_button = ttk.Button(self.root, text="Live Data",
+                                      command=self._live_data, state="disabled")
+        self.live_button.grid(row=5, column=1, padx=5, pady=5)
+
+        self.reset_cal_button = ttk.Button(self.root, text="Reset Cal",
+                                           command=self._reset_calibration, state="disabled")
+        self.reset_cal_button.grid(row=5, column=2, padx=5, pady=5)
+
+        # Close button (always enabled)
+        self.close_button = ttk.Button(self.root, text="Close", command=self._on_closing)
+        self.close_button.grid(row=6, column=2, padx=5, pady=5)
+
+    def _refresh_serial_ports(self):
+        """Refresh available serial ports"""
+        try:
+            ports = [port.device for port in serial.tools.list_ports.comports()]
+            self.serial_port_combobox['values'] = ports
+            if ports and not self.serial_port_combobox.get():
+                self.serial_port_combobox.set(ports[0])
+            self.logger.info(f"Found {len(ports)} serial ports")
+        except Exception as e:
+            self.logger.error(f"Failed to refresh serial ports: {e}")
+            messagebox.showerror("Port Error", f"Failed to scan for serial ports: {e}")
+
+    def _connect_serial(self):
+        """Connect to selected serial port"""
+        port = self.serial_port_combobox.get()
+        if not port:
+            messagebox.showwarning("No Port", "Please select a serial port")
             return
 
-        if not self.finished_startup:
-            self.update_status("Connect to device first!")
-            return
+        self._update_status("Connecting...")
 
-        self.live_plot_active = True
-        self.live_start_time = time.time()
-        self.live_data_button.config(state="disabled")
+        # Run connection in separate thread to avoid blocking UI
+        def connect_thread():
+            success = self.serial_handler.connect(port)
+            if success:
+                # Enable buttons on successful connection
+                self.root.after(0, lambda: [
+                    self._enable_buttons(),
+                    self._update_status("Connected! Waiting for device..."),
+                    setattr(self, 'startup_complete', True)
+                ])
+            else:
+                self.root.after(0, lambda: self._update_status("Connection failed"))
 
-        # Clear buffers
-        for key in self.live_data_buffers:
-            self.live_data_buffers[key].clear()
+        thread = SafeThread(target=connect_thread, logger=self.logger)
+        thread.start()
 
-        # Create live plotting window
-        self.create_live_plot_window()
+    def _start_recording(self):
+        """Start data recording"""
+        try:
+            self.data_processor.start_recording()
+            self.unsaved_data = True
 
-    def create_live_plot_window(self):
-        """Create fast live plotting window using tkinter Canvas"""
-        self.live_window = tk.Toplevel(self.root)
-        self.live_window.title("Live Force Data")
-        self.live_window.geometry("900x700")
+            # Update UI
+            self.record_button.config(state="disabled")
+            self.stop_button.config(state="normal")
+            self.save_button.config(state="disabled")
+            self.tare_button.config(state="disabled")
+            self.calibrate_button.config(state="disabled")
 
-        # Create main frame
-        main_frame = ttk.Frame(self.live_window)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            self._update_status("Recording...")
+            self.logger.info("Recording started by user")
 
-        # Title
-        title_label = ttk.Label(main_frame, text="Live Force Data", font=("Arial", 14, "bold"))
-        title_label.pack(pady=(0, 10))
+        except Exception as e:
+            self.logger.error(f"Failed to start recording: {e}")
+            messagebox.showerror("Recording Error", f"Failed to start recording: {e}")
 
-        # Current values frame
-        values_frame = ttk.Frame(main_frame)
-        values_frame.pack(fill=tk.X, pady=(0, 10))
+    def _stop_recording(self):
+        """Stop data recording"""
+        try:
+            self.data_processor.stop_recording()
 
-        # Current value labels
-        self.live_labels = {}
-        sensor_names = ["Right-Rear", "Right-Front", "Left-Rear", "Left-Front"]
-        sensor_keys = ["rr", "rf", "lr", "lf"]
-        colors = ["#FF4444", "#4444FF", "#44FF44", "#FF8800"]
+            # Update UI
+            self.record_button.config(state="normal")
+            self.stop_button.config(state="disabled")
+            self.save_button.config(state="normal")
+            self.tare_button.config(state="normal")
+            self.calibrate_button.config(state="normal")
+            self.view_button.config(state="normal")
 
-        for i, (key, name, color) in enumerate(zip(sensor_keys, sensor_names, colors)):
-            label = ttk.Label(values_frame, text=f"{name}: 0.00 g", font=("Arial", 12))
-            label.grid(row=i // 2, column=i % 2, padx=20, pady=5, sticky="w")
-            self.live_labels[key] = label
+            self._update_status("Recording stopped")
+            self.logger.info("Recording stopped by user")
 
-        # Canvas for plotting
-        canvas_frame = ttk.Frame(main_frame)
-        canvas_frame.pack(fill=tk.BOTH, expand=True)
+        except Exception as e:
+            self.logger.error(f"Failed to stop recording: {e}")
+            messagebox.showerror("Recording Error", f"Failed to stop recording: {e}")
 
-        self.plot_canvas = tk.Canvas(canvas_frame, bg='white', height=400)
-        self.plot_canvas.pack(fill=tk.BOTH, expand=True)
-
-        # Plot parameters
-        self.plot_margin = 60
-        self.plot_colors = {"rr": "#FF4444", "rf": "#4444FF", "lr": "#44FF44", "lf": "#FF8800"}
-
-        # Control buttons
-        control_frame = ttk.Frame(main_frame)
-        control_frame.pack(fill=tk.X, pady=(10, 0))
-
-        ttk.Button(control_frame, text="Clear", command=self.clear_live_plot).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(control_frame, text="Close", command=self.close_live_plot).pack(side=tk.RIGHT)
-
-        # Bind window close event
-        self.live_window.protocol("WM_DELETE_WINDOW", self.close_live_plot)
-
-        # Start updating
-        self.update_live_plot()
-
-    def update_live_plot(self):
-        """Update the live plot with new data"""
-        if not self.live_plot_active or not self.live_window or not self.live_window.winfo_exists():
+    def _save_data(self):
+        """Save recorded data with progress dialog"""
+        if not self.data_processor.has_data():
+            messagebox.showwarning("No Data", "No recorded data to save")
             return
 
         try:
-            # Process queued data points
+            # Show progress dialog
+            self.current_progress_dialog = ProgressDialog(
+                self.root, "Saving Data", 10
+            )
+
+            def save_thread():
+                try:
+                    data = self.data_processor.get_recording_data()
+
+                    def progress_callback(percent, message):
+                        if self.current_progress_dialog:
+                            self.current_progress_dialog.update(percent, message)
+
+                    success, message = self.file_manager.save_data(data, progress_callback)
+
+                    # Update UI from main thread
+                    def update_ui():
+                        if self.current_progress_dialog:
+                            self.current_progress_dialog.close()
+                            self.current_progress_dialog = None
+
+                        if success:
+                            self.unsaved_data = False
+                            self._update_status("Data saved successfully!")
+                            messagebox.showinfo("Save Complete", message)
+                        else:
+                            self._update_status("Save failed")
+                            messagebox.showerror("Save Error", message)
+
+                    self.root.after(0, update_ui)
+
+                except Exception as e:
+                    error_msg = f"Save operation failed: {e}"
+                    self.logger.error(error_msg, exc_info=True)
+
+                    def show_error():
+                        if self.current_progress_dialog:
+                            self.current_progress_dialog.close()
+                            self.current_progress_dialog = None
+                        messagebox.showerror("Save Error", error_msg)
+
+                    self.root.after(0, show_error)
+
+            thread = SafeThread(target=save_thread, logger=self.logger)
+            thread.start()
+
+        except Exception as e:
+            self.logger.error(f"Failed to initiate save: {e}")
+            messagebox.showerror("Save Error", f"Failed to start save operation: {e}")
+
+    def _tare(self):
+        """Perform tare operation with progress dialog"""
+        if not self.serial_handler.is_connected:
+            messagebox.showwarning("Not Connected", "Please connect to device first")
+            return
+
+        try:
+            # Show progress dialog
+            progress_dialog = ProgressDialog(self.root, "Taring Sensors", Config.TARE_TIME)
+
+            def tare_thread():
+                try:
+                    tare_values = [0.0, 0.0, 0.0, 0.0]
+                    start_time = time.time()
+                    sample_count = 0
+                    invalid_count = 0
+
+                    while (time.time() - start_time) < Config.TARE_TIME:
+                        if progress_dialog.is_cancelled():
+                            break
+
+                        elapsed = time.time() - start_time
+                        remaining = Config.TARE_TIME - elapsed
+                        progress = (elapsed / Config.TARE_TIME) * 100
+
+                        progress_dialog.update(
+                            progress,
+                            f"Taring: {remaining:.1f}s remaining, {sample_count} samples"
+                        )
+
+                        try:
+                            with self.serial_handler._serial_operation() as ser:
+                                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                                if line:
+                                    validator = DataValidator(self.logger)
+                                    is_valid, values, _ = validator.validate_sensor_data(line)
+
+                                    if is_valid and values:
+                                        for i in range(4):
+                                            tare_values[i] += values[i]
+                                        sample_count += 1
+                                    else:
+                                        invalid_count += 1
+                        except Exception:
+                            pass  # Continue on individual read errors
+
+                        time.sleep(0.01)
+
+                    def update_ui():
+                        progress_dialog.close()
+
+                        if progress_dialog.is_cancelled():
+                            self._update_status("Tare cancelled")
+                            return
+
+                        if sample_count > 0:
+                            # Calculate average
+                            final_tare = [val / sample_count for val in tare_values]
+                            self.data_processor.set_tare(final_tare)
+
+                            # Save calibration data
+                            self._save_calibration_data()
+
+                            self._update_status(f"Tared! ({sample_count} samples)")
+                            messagebox.showinfo("Tare Complete",
+                                                f"Tare completed with {sample_count} samples\n"
+                                                f"{invalid_count} invalid readings ignored")
+                        else:
+                            self._update_status("Tare failed - no valid data")
+                            messagebox.showerror("Tare Failed", "No valid data collected during tare")
+
+                    self.root.after(0, update_ui)
+
+                except Exception as e:
+                    error_msg = f"Tare operation failed: {e}"
+                    self.logger.error(error_msg, exc_info=True)
+
+                    def show_error():
+                        progress_dialog.close()
+                        messagebox.showerror("Tare Error", error_msg)
+
+                    self.root.after(0, show_error)
+
+            thread = SafeThread(target=tare_thread, logger=self.logger)
+            thread.start()
+
+        except Exception as e:
+            self.logger.error(f"Failed to start tare: {e}")
+            messagebox.showerror("Tare Error", f"Failed to start tare operation: {e}")
+
+    def _calibrate(self):
+        """Perform calibration with enhanced UI"""
+        if not self.serial_handler.is_connected:
+            messagebox.showwarning("Not Connected", "Please connect to device first")
+            return
+
+        try:
+            # Sensor selection dialog
+            sensor_options = [
+                ("Right-Rear (RR)", 0),
+                ("Right-Front (RF)", 1),
+                ("Left-Rear (LR)", 2),
+                ("Left-Front (LF)", 3)
+            ]
+
+            # Create custom dialog for sensor selection
+            selection_dialog = tk.Toplevel(self.root)
+            selection_dialog.title("Select Sensor")
+            selection_dialog.geometry("300x200")
+            selection_dialog.transient(self.root)
+            selection_dialog.grab_set()
+
+            selected_sensor = tk.IntVar(value=-1)
+
+            ttk.Label(selection_dialog, text="Select sensor to calibrate:").pack(pady=10)
+
+            for name, index in sensor_options:
+                ttk.Radiobutton(
+                    selection_dialog,
+                    text=name,
+                    variable=selected_sensor,
+                    value=index
+                ).pack(anchor=tk.W, padx=20)
+
+            def on_sensor_selected():
+                if selected_sensor.get() >= 0:
+                    selection_dialog.destroy()
+                    self._perform_calibration(selected_sensor.get(), sensor_options[selected_sensor.get()][0])
+                else:
+                    messagebox.showwarning("No Selection", "Please select a sensor")
+
+            def on_cancel():
+                selection_dialog.destroy()
+
+            button_frame = ttk.Frame(selection_dialog)
+            button_frame.pack(pady=20)
+
+            ttk.Button(button_frame, text="OK", command=on_sensor_selected).pack(side=tk.LEFT, padx=5)
+            ttk.Button(button_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
+
+        except Exception as e:
+            self.logger.error(f"Failed to start calibration: {e}")
+            messagebox.showerror("Calibration Error", f"Failed to start calibration: {e}")
+
+    def _perform_calibration(self, sensor_index: int, sensor_name: str):
+        """Perform calibration for specific sensor"""
+        try:
+            # Get calibration weight
+            weight = simpledialog.askfloat(
+                "Calibration Weight",
+                f"Place a known weight on the {sensor_name} sensor.\n\nEnter the weight in grams:",
+                minvalue=0.1,
+                maxvalue=10000.0
+            )
+
+            if weight is None or weight <= 0:
+                self._update_status("Calibration cancelled")
+                return
+
+            # Show progress dialog
+            progress_dialog = ProgressDialog(
+                self.root, f"Calibrating {sensor_name}", Config.CALIBRATION_TIME
+            )
+
+            def calibration_thread():
+                try:
+                    calibration_data = 0.0
+                    start_time = time.time()
+                    sample_count = 0
+
+                    while (time.time() - start_time) < Config.CALIBRATION_TIME:
+                        if progress_dialog.is_cancelled():
+                            break
+
+                        elapsed = time.time() - start_time
+                        remaining = Config.CALIBRATION_TIME - elapsed
+                        progress = (elapsed / Config.CALIBRATION_TIME) * 100
+
+                        progress_dialog.update(
+                            progress,
+                            f"Calibrating {sensor_name}: {remaining:.1f}s remaining"
+                        )
+
+                        try:
+                            with self.serial_handler._serial_operation() as ser:
+                                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                                if line:
+                                    validator = DataValidator(self.logger)
+                                    is_valid, values, _ = validator.validate_sensor_data(line)
+
+                                    if is_valid and values:
+                                        sensor_value = values[sensor_index]
+
+                                        # Apply tare if available
+                                        if (self.data_processor.is_tared and
+                                                self.data_processor.tare_values):
+                                            sensor_value -= self.data_processor.tare_values[sensor_index]
+
+                                        calibration_data += sensor_value
+                                        sample_count += 1
+                        except Exception:
+                            pass  # Continue on individual read errors
+
+                        time.sleep(0.01)
+
+                    def update_ui():
+                        progress_dialog.close()
+
+                        if progress_dialog.is_cancelled():
+                            self._update_status("Calibration cancelled")
+                            return
+
+                        if sample_count > 0:
+                            avg_reading = calibration_data / sample_count
+
+                            if avg_reading != 0:
+                                # Initialize calibration values if needed
+                                if not self.data_processor.calibration_values:
+                                    self.data_processor.calibration_values = [1.0, 1.0, 1.0, 1.0]
+
+                                # Calculate calibration factor
+                                cal_factor = avg_reading / weight
+                                cal_values = self.data_processor.calibration_values.copy()
+                                cal_values[sensor_index] = cal_factor
+
+                                self.data_processor.set_calibration(cal_values)
+
+                                # Save calibration data
+                                self._save_calibration_data()
+
+                                self._update_status(f"{sensor_name} calibrated!")
+                                messagebox.showinfo("Calibration Complete",
+                                                    f"{sensor_name} calibrated successfully!\n"
+                                                    f"Factor: {cal_factor:.4f} units/gram\n"
+                                                    f"Samples: {sample_count}")
+                            else:
+                                self._update_status("Calibration failed - zero reading")
+                                messagebox.showerror("Calibration Failed", "Zero reading during calibration")
+                        else:
+                            self._update_status("Calibration failed - no data")
+                            messagebox.showerror("Calibration Failed", "No valid data collected")
+
+                    self.root.after(0, update_ui)
+
+                except Exception as e:
+                    error_msg = f"Calibration failed: {e}"
+                    self.logger.error(error_msg, exc_info=True)
+
+                    def show_error():
+                        progress_dialog.close()
+                        messagebox.showerror("Calibration Error", error_msg)
+
+                    self.root.after(0, show_error)
+
+            thread = SafeThread(target=calibration_thread, logger=self.logger)
+            thread.start()
+
+        except Exception as e:
+            self.logger.error(f"Failed to perform calibration: {e}")
+            messagebox.showerror("Calibration Error", f"Calibration failed: {e}")
+
+    def _show_calibration_status(self):
+        """Show current calibration status"""
+        try:
+            if self.data_processor.calibration_values:
+                status_text = "Calibration Status:\n\n"
+                sensor_names = ["Right-Rear (RR)", "Right-Front (RF)",
+                                "Left-Rear (LR)", "Left-Front (LF)"]
+
+                for i, (name, cal_val) in enumerate(zip(sensor_names, self.data_processor.calibration_values)):
+                    if cal_val != 1.0:
+                        status_text += f"{name}: ✓ Calibrated ({cal_val:.4f})\n"
+                    else:
+                        status_text += f"{name}: ✗ Not calibrated\n"
+
+                status_text += f"\nTare Status: {'✓ Tared' if self.data_processor.is_tared else '✗ Not tared'}"
+
+                messagebox.showinfo("Calibration Status", status_text)
+            else:
+                messagebox.showinfo("Calibration Status", "No calibration data available")
+
+        except Exception as e:
+            self.logger.error(f"Failed to show calibration status: {e}")
+            messagebox.showerror("Status Error", f"Failed to show status: {e}")
+
+    def _reset_calibration(self):
+        """Reset calibration values"""
+        try:
+            result = messagebox.askyesno(
+                "Reset Calibration",
+                "This will reset all calibration and tare values. Continue?"
+            )
+
+            if result:
+                self.data_processor.calibration_values = [1.0, 1.0, 1.0, 1.0]
+                self.data_processor.tare_values = [0.0, 0.0, 0.0, 0.0]
+                self.data_processor.is_calibrated = False
+                self.data_processor.is_tared = False
+
+                # Delete calibration file
+                try:
+                    cal_file = os.path.join(self.file_manager.data_folder, 'calibration.json')
+                    if os.path.exists(cal_file):
+                        os.remove(cal_file)
+                        self.logger.info("Calibration file deleted")
+                except Exception as e:
+                    self.logger.warning(f"Failed to delete calibration file: {e}")
+
+                self._update_status("Calibration reset")
+                messagebox.showinfo("Reset Complete", "Calibration and tare values have been reset")
+
+        except Exception as e:
+            self.logger.error(f"Failed to reset calibration: {e}")
+            messagebox.showerror("Reset Error", f"Failed to reset calibration: {e}")
+
+    def _view_data(self):
+        """View recorded data in a plot"""
+        if not self.data_processor.has_data():
+            messagebox.showwarning("No Data", "No recorded data to view")
+            return
+
+        try:
+            data = self.data_processor.get_recording_data()
+
+            # Create plot
+            plt.figure(figsize=(12, 8))
+
+            colors = ['red', 'blue', 'green', 'orange']
+            labels = ['Right-Rear', 'Right-Front', 'Left-Rear', 'Left-Front']
+
+            for i, (sensor, label, color) in enumerate(zip(['rr', 'rf', 'lr', 'lf'], labels, colors)):
+                if data[sensor]:
+                    times = [point[0] for point in data[sensor]]
+                    values = [point[1] for point in data[sensor]]
+                    plt.plot(times, values, label=label, color=color, linewidth=2)
+
+            plt.xlabel('Time (seconds)', fontsize=12)
+            plt.ylabel('Force (grams)', fontsize=12)
+            plt.title('Recorded Force Data', fontsize=14, fontweight='bold')
+            plt.legend(fontsize=10)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            self.logger.error(f"Failed to view data: {e}")
+            messagebox.showerror("View Error", f"Failed to display data: {e}")
+
+    def _live_data(self):
+        """Open live data plotting window"""
+        if self.live_plot_active and self.live_window:
+            # Window already open, bring to front
+            try:
+                self.live_window.lift()
+                return
+            except tk.TclError:
+                # Window was destroyed
+                self.live_plot_active = False
+                self.live_window = None
+
+        if not self.serial_handler.is_connected:
+            messagebox.showwarning("Not Connected", "Please connect to device first")
+            return
+
+        try:
+            self.live_plot_active = True
+            self.live_button.config(state="disabled")
+
+            # Clear live data
+            self.data_processor.clear_live_data()
+
+            # Create live plotting window
+            self._create_live_plot_window()
+
+        except Exception as e:
+            self.logger.error(f"Failed to start live data: {e}")
+            messagebox.showerror("Live Data Error", f"Failed to start live data: {e}")
+
+    def _create_live_plot_window(self):
+        """Create live plotting window with enhanced features"""
+        try:
+            self.live_window = tk.Toplevel(self.root)
+            self.live_window.title("Live Force Data")
+            self.live_window.geometry("1000x700")
+
+            # Main frame
+            main_frame = ttk.Frame(self.live_window)
+            main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+            # Title
+            title_label = ttk.Label(main_frame, text="Live Force Data",
+                                    font=("Arial", 16, "bold"))
+            title_label.pack(pady=(0, 10))
+
+            # Current values frame with enhanced display
+            values_frame = ttk.LabelFrame(main_frame, text="Current Values", padding=10)
+            values_frame.pack(fill=tk.X, pady=(0, 10))
+
+            # Create value displays
+            self.live_labels = {}
+            sensor_info = [
+                ("rr", "Right-Rear", "#FF4444"),
+                ("rf", "Right-Front", "#4444FF"),
+                ("lr", "Left-Rear", "#44FF44"),
+                ("lf", "Left-Front", "#FF8800")
+            ]
+
+            for i, (key, name, color) in enumerate(sensor_info):
+                frame = ttk.Frame(values_frame)
+                frame.grid(row=i // 2, column=i % 2, padx=20, pady=5, sticky="w")
+
+                # Color indicator
+                color_label = tk.Label(frame, text="●", fg=color, font=("Arial", 16))
+                color_label.pack(side=tk.LEFT)
+
+                # Value label
+                value_label = ttk.Label(frame, text=f"{name}: 0.00 g",
+                                        font=("Arial", 12, "bold"))
+                value_label.pack(side=tk.LEFT, padx=(5, 0))
+
+                self.live_labels[key] = value_label
+
+            # Canvas for plotting
+            canvas_frame = ttk.LabelFrame(main_frame, text="Real-time Plot", padding=5)
+            canvas_frame.pack(fill=tk.BOTH, expand=True)
+
+            self.plot_canvas = tk.Canvas(canvas_frame, bg='white', height=400)
+            self.plot_canvas.pack(fill=tk.BOTH, expand=True)
+
+            # Control frame
+            control_frame = ttk.Frame(main_frame)
+            control_frame.pack(fill=tk.X, pady=(10, 0))
+
+            ttk.Button(control_frame, text="Clear Plot",
+                       command=self._clear_live_plot).pack(side=tk.LEFT, padx=(0, 10))
+
+            ttk.Button(control_frame, text="Export Current View",
+                       command=self._export_live_view).pack(side=tk.LEFT, padx=(0, 10))
+
+            ttk.Button(control_frame, text="Close",
+                       command=self._close_live_plot).pack(side=tk.RIGHT)
+
+            # Plot settings
+            self.plot_margin = 60
+            self.plot_colors = {"rr": "#FF4444", "rf": "#4444FF", "lr": "#44FF44", "lf": "#FF8800"}
+            self.live_start_time = time.time()
+
+            # Bind window close event
+            self.live_window.protocol("WM_DELETE_WINDOW", self._close_live_plot)
+
+            # Start updating
+            self._update_live_plot()
+
+        except Exception as e:
+            self.logger.error(f"Failed to create live plot window: {e}")
+            self.live_plot_active = False
+            raise
+
+    def _update_live_plot(self):
+        """Update live plot with enhanced performance"""
+        if not self.live_plot_active or not self.live_window:
+            return
+
+        try:
+            # Process queued data points (limit to prevent UI lag)
             points_processed = 0
             latest_values = {}
 
-            while not self.live_data_queue.empty() and points_processed < 20:  # Limit processing per update
+            while not self.data_processor.live_data_queue.empty() and points_processed < 20:
                 try:
-                    timestamp, rr, rf, lr, lf = self.live_data_queue.get_nowait()
+                    timestamp, rr, rf, lr, lf = self.data_processor.live_data_queue.get_nowait()
 
-                    # Add to rolling buffers
-                    relative_time = timestamp - self.live_start_time
-                    self.live_data_buffers['time'].append(relative_time)
-                    self.live_data_buffers['rr'].append(rr)
-                    self.live_data_buffers['rf'].append(rf)
-                    self.live_data_buffers['lr'].append(lr)
-                    self.live_data_buffers['lf'].append(lf)
-
-                    # Keep latest values for display
+                    # Store latest values for display
                     latest_values = {'rr': rr, 'rf': rf, 'lr': lr, 'lf': lf}
                     points_processed += 1
 
@@ -657,23 +1620,29 @@ class WalkerMonitorApp:
 
             # Update current value labels
             if latest_values:
-                sensor_names = {"rr": "Right-Rear", "rf": "Right-Front", "lr": "Left-Rear", "lf": "Left-Front"}
+                sensor_names = {"rr": "Right-Rear", "rf": "Right-Front",
+                                "lr": "Left-Rear", "lf": "Left-Front"}
                 for key, value in latest_values.items():
-                    self.live_labels[key].config(text=f"{sensor_names[key]}: {value:6.2f} g")
+                    if key in self.live_labels:
+                        self.live_labels[key].config(
+                            text=f"{sensor_names[key]}: {value:7.2f} g"
+                        )
 
             # Redraw plot if we have data
-            if len(self.live_data_buffers['time']) > 1:
-                self.draw_live_plot()
+            buffer_data = self.data_processor.live_data_buffers
+            if len(buffer_data['time']) > 1:
+                self._draw_live_plot()
 
             # Schedule next update
-            self.live_window.after(50, self.update_live_plot)  # 20 FPS
+            if self.live_window:
+                self.live_window.after(Config.LIVE_PLOT_UPDATE_RATE, self._update_live_plot)
 
         except Exception as e:
-            print(f"Error updating live plot: {e}")
+            self.logger.error(f"Error updating live plot: {e}")
             self.live_plot_active = False
 
-    def draw_live_plot(self):
-        """Draw the live plot on canvas"""
+    def _draw_live_plot(self):
+        """Draw the live plot with improved visualization"""
         try:
             # Clear canvas
             self.plot_canvas.delete("all")
@@ -683,7 +1652,7 @@ class WalkerMonitorApp:
             canvas_height = self.plot_canvas.winfo_height()
 
             if canvas_width <= 1 or canvas_height <= 1:
-                return  # Canvas not ready
+                return
 
             # Calculate plot area
             plot_width = canvas_width - 2 * self.plot_margin
@@ -692,471 +1661,403 @@ class WalkerMonitorApp:
             if plot_width <= 0 or plot_height <= 0:
                 return
 
-            # Get data
-            time_data = list(self.live_data_buffers['time'])
+            # Get data from buffers
+            buffer_data = self.data_processor.live_data_buffers
+            time_data = buffer_data['time'].get_data()
 
             if len(time_data) < 2:
                 return
 
-            # Calculate data ranges
-            time_min, time_max = min(time_data), max(time_data)
-            time_range = max(time_max - time_min, 1)  # Avoid division by zero
+            # Calculate time range for x-axis (show last 30 seconds)
+            current_time = time.time()
+            time_window = 30.0  # seconds
+            time_min = current_time - time_window
+            time_max = current_time
 
-            # Find force data range
+            # Filter data to time window and calculate force range
+            filtered_data = {}
             all_forces = []
-            for key in ['rr', 'rf', 'lr', 'lf']:
-                all_forces.extend(list(self.live_data_buffers[key]))
 
-            if all_forces:
-                force_min, force_max = min(all_forces), max(all_forces)
-                force_range = max(force_max - force_min, 1)  # Avoid division by zero
-            else:
-                force_min, force_max, force_range = 0, 100, 100
+            for sensor in ['rr', 'rf', 'lr', 'lf']:
+                sensor_data = buffer_data[sensor].get_data()
+                filtered_points = []
 
-            # Draw axes
-            # X-axis
-            self.plot_canvas.create_line(
-                self.plot_margin, canvas_height - self.plot_margin,
-                                  canvas_width - self.plot_margin, canvas_height - self.plot_margin,
-                fill="black", width=2
-            )
+                for t, f in zip(time_data, sensor_data):
+                    if t >= time_min:
+                        filtered_points.append((t, f))
+                        all_forces.append(f)
 
-            # Y-axis
-            self.plot_canvas.create_line(
-                self.plot_margin, self.plot_margin,
-                self.plot_margin, canvas_height - self.plot_margin,
-                fill="black", width=2
-            )
+                filtered_data[sensor] = filtered_points
 
-            # Draw grid and labels
-            # Y-axis labels (force)
-            for i in range(5):
-                y_val = force_min + (force_max - force_min) * i / 4
-                y_pos = canvas_height - self.plot_margin - (plot_height * i / 4)
+            if not all_forces:
+                return
 
-                # Grid line
-                self.plot_canvas.create_line(
-                    self.plot_margin, y_pos,
-                    canvas_width - self.plot_margin, y_pos,
-                    fill="lightgray", width=1
-                )
+            # Calculate force range with some padding
+            force_min, force_max = min(all_forces), max(all_forces)
+            force_range = max(force_max - force_min, 10)  # Minimum range of 10 units
+            force_padding = force_range * 0.1
+            force_min -= force_padding
+            force_max += force_padding
+            force_range = force_max - force_min
 
-                # Label
-                self.plot_canvas.create_text(
-                    self.plot_margin - 10, y_pos,
-                    text=f"{y_val:.1f}", anchor="e", font=("Arial", 8)
-                )
-
-            # X-axis labels (time)
-            for i in range(5):
-                x_val = time_min + (time_max - time_min) * i / 4
-                x_pos = self.plot_margin + (plot_width * i / 4)
-
-                # Grid line
-                self.plot_canvas.create_line(
-                    x_pos, self.plot_margin,
-                    x_pos, canvas_height - self.plot_margin,
-                    fill="lightgray", width=1
-                )
-
-                # Label
-                self.plot_canvas.create_text(
-                    x_pos, canvas_height - self.plot_margin + 15,
-                    text=f"{x_val:.1f}s", anchor="n", font=("Arial", 8)
-                )
+            # Draw grid and axes
+            self._draw_plot_grid(canvas_width, canvas_height, plot_width, plot_height,
+                                 time_min, time_max, force_min, force_max)
 
             # Draw data lines
-            for sensor_key in ['rr', 'rf', 'lr', 'lf']:
-                force_data = list(self.live_data_buffers[sensor_key])
-
-                if len(force_data) < 2:
-                    continue
-
-                # Convert data to screen coordinates
-                points = []
-                for i, (t, f) in enumerate(zip(time_data, force_data)):
-                    x = self.plot_margin + ((t - time_min) / time_range) * plot_width
-                    y = canvas_height - self.plot_margin - ((f - force_min) / force_range) * plot_height
-                    points.extend([x, y])
-
-                # Draw line
-                if len(points) >= 4:  # Need at least 2 points
-                    self.plot_canvas.create_line(
-                        points, fill=self.plot_colors[sensor_key], width=2, smooth=True
-                    )
+            for sensor in ['rr', 'rf', 'lr', 'lf']:
+                points = filtered_data[sensor]
+                if len(points) >= 2:
+                    self._draw_sensor_line(points, time_min, time_max, force_min, force_range,
+                                           plot_width, plot_height, self.plot_colors[sensor])
 
             # Draw legend
-            legend_x = canvas_width - 150
-            legend_y = 20
-            sensor_names = {"rr": "Right-Rear", "rf": "Right-Front", "lr": "Left-Rear", "lf": "Left-Front"}
-
-            for i, (key, name) in enumerate(sensor_names.items()):
-                y = legend_y + i * 20
-                # Color box
-                self.plot_canvas.create_rectangle(
-                    legend_x, y, legend_x + 15, y + 10,
-                    fill=self.plot_colors[key], outline=self.plot_colors[key]
-                )
-                # Text
-                self.plot_canvas.create_text(
-                    legend_x + 20, y + 5, text=name, anchor="w", font=("Arial", 9)
-                )
-
-            # Labels
-            self.plot_canvas.create_text(
-                canvas_width // 2, canvas_height - 20,
-                text="Time (seconds)", anchor="n", font=("Arial", 10, "bold")
-            )
-
-            self.plot_canvas.create_text(
-                20, canvas_height // 2, text="Force (grams)",
-                anchor="center", font=("Arial", 10, "bold"), angle=90
-            )
+            self._draw_plot_legend(canvas_width)
 
         except Exception as e:
-            print(f"Error drawing live plot: {e}")
+            self.logger.error(f"Error drawing live plot: {e}")
 
-    def clear_live_plot(self):
-        """Clear the live plot data"""
-        for key in self.live_data_buffers:
-            self.live_data_buffers[key].clear()
-        self.live_start_time = time.time()
+    def _draw_plot_grid(self, canvas_width, canvas_height, plot_width, plot_height,
+                        time_min, time_max, force_min, force_max):
+        """Draw plot grid and axes"""
+        # Draw axes
+        self.plot_canvas.create_line(
+            self.plot_margin, canvas_height - self.plot_margin,
+                              canvas_width - self.plot_margin, canvas_height - self.plot_margin,
+            fill="black", width=2
+        )
 
-        # Clear the canvas
-        if self.plot_canvas:
-            self.plot_canvas.delete("all")
+        self.plot_canvas.create_line(
+            self.plot_margin, self.plot_margin,
+            self.plot_margin, canvas_height - self.plot_margin,
+            fill="black", width=2
+        )
 
-    def close_live_plot(self):
-        """Close the live plot window"""
-        self.live_plot_active = False
-        self.live_data_button.config(state="normal")
+        # Draw grid lines and labels
+        # Y-axis (force)
+        for i in range(6):
+            y_val = force_min + (force_max - force_min) * i / 5
+            y_pos = canvas_height - self.plot_margin - (plot_height * i / 5)
 
-        # Clear the queue
-        while not self.live_data_queue.empty():
-            try:
-                self.live_data_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        if self.live_window:
-            self.live_window.destroy()
-            self.live_window = None
-
-    def tare(self):
-        self.update_status("Zeroing")
-        try:
-            with self.serial_lock:
-                self.tare_values = [0, 0, 0, 0]
-                start_time = time.time()
-                nsamples = 0
-                last_status_update = start_time
-                invalid_count = 0
-
-                while time.time() - start_time < 10:
-                    current_time = time.time()
-                    elapsed = current_time - start_time
-                    remaining = 10 - elapsed
-
-                    # Update status every 0.5 seconds
-                    if current_time - last_status_update >= 0.5:
-                        self.update_status(
-                            f"Zeroing: {remaining:.1f}s remaining, {nsamples} samples ({invalid_count} invalid)")
-                        last_status_update = current_time
-
-                    if self.serial and self.serial.is_open:
-                        line = self.serial.readline().decode().strip()
-                        if line:
-                            if self.parse_sensor_data_for_calibration(line):
-                                # Valid data - add to tare
-                                values = line.split(',')
-                                rr, rf, lr, lf = map(float, values)
-                                self.tare_values[0] += rr
-                                self.tare_values[1] += rf
-                                self.tare_values[2] += lr
-                                self.tare_values[3] += lf
-                                nsamples += 1
-                            else:
-                                invalid_count += 1
-                    else:
-                        self.update_status("Serial port is not open.")
-                        return
-
-                if nsamples > 0:
-                    # Calculate average values
-                    self.tare_values = [val / nsamples for val in self.tare_values]
-                    print(f"Tare values: {self.tare_values} (from {nsamples} samples, {invalid_count} invalid)")
-                    self.update_status("Tared!")
-                    self.is_tared = True
-
-                    # Save the updated tare values
-                    self.save_calibration_values()
-                else:
-                    self.update_status("No valid data collected for tare")
-
-        except serial.SerialException as e:
-            print("Serial error:", e)
-
-    def parse_sensor_data_for_calibration(self, line):
-        """
-        Simplified validation for calibration/tare operations
-        Returns True if data is valid for calibration use
-        """
-        try:
-            if not line or line.count(',') != 3:
-                return False
-
-            values = line.split(',')
-
-            # Quick validation
-            for val in values:
-                val = val.strip()
-                if '..' in val or val.count('.') > 1:
-                    return False
-                try:
-                    parsed_val = float(val)
-                    if abs(parsed_val) > 1000000:  # Sanity check
-                        return False
-                except ValueError:
-                    return False
-
-            return True
-
-        except Exception:
-            return False
-
-    def calibrate(self):
-        """
-        Calibrate individual sensors one at a time with improved status updates
-        """
-        try:
-            self.update_status("Select sensor to calibrate...")
-
-            # Sensor options for user selection
-            sensor_options = {
-                "0": ("Right-Rear (RR)", 0),
-                "1": ("Right-Front (RF)", 1),
-                "2": ("Left-Rear (LR)", 2),
-                "3": ("Left-Front (LF)", 3)
-            }
-
-            # Ask user to select which sensor to calibrate
-            selection_text = "Select sensor to calibrate:\n"
-            for key, (name, _) in sensor_options.items():
-                selection_text += f"{key} = {name}\n"
-            selection_text += "\nEnter 0-3:"
-
-            selected_sensor = simpledialog.askstring(
-                "Sensor Selection",
-                selection_text
+            # Grid line
+            self.plot_canvas.create_line(
+                self.plot_margin, y_pos,
+                canvas_width - self.plot_margin, y_pos,
+                fill="lightgray", width=1, dash=(2, 2)
             )
 
-            if selected_sensor is None:  # User cancelled
-                self.update_status("Calibration cancelled")
-                return
-
-            if selected_sensor not in sensor_options:
-                self.update_status("Invalid sensor selection")
-                return
-
-            sensor_name, sensor_index = sensor_options[selected_sensor]
-
-            # Ask for calibration weight for the selected sensor
-            calibration_weight = simpledialog.askfloat(
-                "Calibration Weight",
-                f"Place a known weight on the {sensor_name} sensor.\n\nEnter the weight in grams:"
+            # Label
+            self.plot_canvas.create_text(
+                self.plot_margin - 5, y_pos,
+                text=f"{y_val:.1f}", anchor="e", font=("Arial", 9)
             )
 
-            if calibration_weight is None or calibration_weight <= 0:
-                self.update_status("Invalid calibration weight")
-                return
+        # X-axis (time) - show relative seconds
+        time_range = time_max - time_min
+        for i in range(6):
+            relative_time = -time_range + (time_range * i / 5)
+            x_pos = self.plot_margin + (plot_width * i / 5)
 
-            # Initialize calibration_values array if not already done
-            if self.calibration_values is None:
-                self.calibration_values = [1.0, 1.0, 1.0, 1.0]
+            # Grid line
+            self.plot_canvas.create_line(
+                x_pos, self.plot_margin,
+                x_pos, canvas_height - self.plot_margin,
+                fill="lightgray", width=1, dash=(2, 2)
+            )
 
-            # Start calibration process
-            self.update_status(f"Starting calibration for {sensor_name}...")
+            # Label
+            self.plot_canvas.create_text(
+                x_pos, canvas_height - self.plot_margin + 15,
+                text=f"{relative_time:.0f}s", anchor="n", font=("Arial", 9)
+            )
 
-            with self.serial_lock:
-                calibration_data = 0
-                start_time = time.time()
-                nsamples = 0
-                last_status_update = start_time
-                invalid_count = 0
+        # Axis labels
+        self.plot_canvas.create_text(
+            canvas_width // 2, canvas_height - 20,
+            text="Time (seconds ago)", anchor="n", font=("Arial", 11, "bold")
+        )
 
-                # Collect data for 5 seconds with status updates
-                while time.time() - start_time < 5:
-                    current_time = time.time()
-                    elapsed = current_time - start_time
-                    remaining = 5 - elapsed
+        self.plot_canvas.create_text(
+            15, canvas_height // 2, text="Force (grams)",
+            anchor="center", font=("Arial", 11, "bold"), angle=90
+        )
 
-                    # Update status every 0.5 seconds
-                    if current_time - last_status_update >= 0.5:
-                        self.update_status(f"Calibrating {sensor_name}: {remaining:.1f}s remaining, {nsamples} samples")
-                        last_status_update = current_time
+    def _draw_sensor_line(self, points, time_min, time_max, force_min, force_range,
+                          plot_width, plot_height, color):
+        """Draw line for a single sensor"""
+        if len(points) < 2:
+            return
 
-                    if self.serial and self.serial.is_open:
-                        line = self.serial.readline().decode().strip()
-                        if line:
-                            if self.parse_sensor_data_for_calibration(line):
-                                values = line.split(',')
-                                rr, rf, lr, lf = map(float, values)
-                                sensor_values = [rr, rf, lr, lf]
+        # Convert points to canvas coordinates
+        canvas_points = []
+        time_range = time_max - time_min
 
-                                # Get the raw value for the selected sensor
-                                sensor_value = sensor_values[sensor_index]
+        for t, f in points:
+            x = self.plot_margin + ((t - time_min) / time_range) * plot_width
+            y = (self.plot_canvas.winfo_height() - self.plot_margin -
+                 ((f - force_min) / force_range) * plot_height)
+            canvas_points.extend([x, y])
 
-                                # Apply tare offset if available
-                                if self.is_tared and self.tare_values:
-                                    sensor_value -= self.tare_values[sensor_index]
+        # Draw line
+        if len(canvas_points) >= 4:
+            self.plot_canvas.create_line(
+                canvas_points, fill=color, width=2, smooth=True
+            )
 
-                                calibration_data += sensor_value
-                                nsamples += 1
-                            else:
-                                invalid_count += 1
+    def _draw_plot_legend(self, canvas_width):
+        """Draw plot legend"""
+        legend_x = canvas_width - 180
+        legend_y = 30
+        sensor_names = {"rr": "Right-Rear", "rf": "Right-Front",
+                        "lr": "Left-Rear", "lf": "Left-Front"}
 
-                    else:
-                        self.update_status("Serial port is not open.")
-                        return
+        # Legend background
+        self.plot_canvas.create_rectangle(
+            legend_x - 10, legend_y - 10,
+            legend_x + 150, legend_y + len(sensor_names) * 25,
+            fill="white", outline="gray", width=1
+        )
 
-                if nsamples > 0:
-                    # Calculate average reading for the selected sensor
-                    avg_reading = calibration_data / nsamples
+        for i, (key, name) in enumerate(sensor_names.items()):
+            y = legend_y + i * 20
 
-                    self.update_status(f"Processing {sensor_name} calibration...")
+            # Color indicator
+            self.plot_canvas.create_line(
+                legend_x, y + 5, legend_x + 20, y + 5,
+                fill=self.plot_colors[key], width=3
+            )
 
-                    # Calculate calibration factor (raw_units_per_gram)
-                    if avg_reading != 0:
-                        self.calibration_values[sensor_index] = avg_reading / calibration_weight
+            # Text
+            self.plot_canvas.create_text(
+                legend_x + 25, y + 5, text=name, anchor="w", font=("Arial", 10)
+            )
 
-                        print(f"Calibration complete for {sensor_name}:")
-                        print(f"  Average reading: {avg_reading:.2f}")
-                        print(f"  Calibration weight: {calibration_weight}g")
-                        print(f"  Calibration factor: {self.calibration_values[sensor_index]:.4f} units/gram")
-                        print(f"  Samples collected: {nsamples}")
-
-                        self.is_calibrated = True
-
-                        # Save calibration values
-                        if self.save_calibration_values():
-                            self.update_status(
-                                f"{sensor_name} calibrated & saved! Factor: {self.calibration_values[sensor_index]:.4f}")
-                        else:
-                            self.update_status(
-                                f"{sensor_name} calibrated! (Save failed) Factor: {self.calibration_values[sensor_index]:.4f}")
-
-                        # Show current calibration status
-                        self.show_calibration_status()
-                    else:
-                        self.update_status("Error: Zero reading during calibration")
-                else:
-                    self.update_status("No valid data collected during calibration")
-
-        except serial.SerialException as e:
-            print("Serial error:", e)
-            self.update_status("Calibration failed - serial error")
-
-    def show_calibration_status(self):
-        """
-        Display which sensors have been calibrated
-        """
-        if self.calibration_values:
-            status_text = "Calibration Status:\n"
-            sensor_names = ["Right-Rear (RR)", "Right-Front (RF)", "Left-Rear (LR)", "Left-Front (LF)"]
-
-            for i, (name, cal_val) in enumerate(zip(sensor_names, self.calibration_values)):
-                if cal_val != 1.0:  # Sensor has been calibrated (not default value)
-                    status_text += f"{name}: ✓ ({cal_val:.4f})\n"
-                else:
-                    status_text += f"{name}: Not calibrated\n"
-
-            messagebox.showinfo("Calibration Status", status_text)
-
-    def reset_calibration(self):
-        """
-        Reset calibration values to defaults and delete saved file
-        """
-        self.calibration_values = [1.0, 1.0, 1.0, 1.0]
-        self.is_calibrated = False
-
-        # Try to delete the calibration file
+    def _clear_live_plot(self):
+        """Clear live plot data"""
         try:
-            cal_file_path = self.get_calibration_file_path()
-            if os.path.exists(cal_file_path):
-                os.remove(cal_file_path)
-                print(f"Calibration file deleted: {cal_file_path}")
+            self.data_processor.clear_live_data()
+            self.live_start_time = time.time()
+
+            if self.plot_canvas:
+                self.plot_canvas.delete("all")
+
+            # Reset value displays
+            for label in self.live_labels.values():
+                original_text = label.cget("text")
+                sensor_name = original_text.split(":")[0]
+                label.config(text=f"{sensor_name}: 0.00 g")
+
         except Exception as e:
-            print(f"Error deleting calibration file: {e}")
+            self.logger.error(f"Failed to clear live plot: {e}")
 
-        self.update_status("Calibration reset")
+    def _export_live_view(self):
+        """Export current live view data"""
+        try:
+            if not self.data_processor.live_data_buffers['time']:
+                messagebox.showinfo("No Data", "No live data to export")
+                return
 
-    def get_calibration_file_path(self):
-        """
-        Get the full path to the calibration file
-        """
-        data_folder = self.get_data_folder_path()
-        return os.path.join(data_folder, 'calibration.json')
+            # Get current buffer data
+            buffer_data = self.data_processor.live_data_buffers
+            time_data = buffer_data['time'].get_data()
 
-    def save_calibration_values(self):
-        """
-        Save calibration values to a JSON file
-        """
-        if self.calibration_values:
+            if not time_data:
+                messagebox.showinfo("No Data", "No live data to export")
+                return
+
+            # Create filename
+            filename = f"live_data_{time.strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            filepath = os.path.join(self.file_manager.data_folder, filename)
+
+            # Prepare data for export
+            export_data = []
+            for i, t in enumerate(time_data):
+                row = {'Timestamp': t}
+                for sensor in ['rr', 'rf', 'lr', 'lf']:
+                    sensor_data = buffer_data[sensor].get_data()
+                    if i < len(sensor_data):
+                        row[sensor.upper()] = sensor_data[i]
+                    else:
+                        row[sensor.upper()] = ''
+                export_data.append(row)
+
+            # Save to CSV
+            df = pd.DataFrame(export_data)
+            df.to_csv(filepath, index=False, float_format='%.6f')
+
+            messagebox.showinfo("Export Complete", f"Live data exported to:\n{filepath}")
+            self.logger.info(f"Live data exported to {filepath}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to export live view: {e}")
+            messagebox.showerror("Export Error", f"Failed to export data: {e}")
+
+    def _close_live_plot(self):
+        """Close live plot window"""
+        try:
+            self.live_plot_active = False
+            self.live_button.config(state="normal")
+
+            if self.live_window:
+                self.live_window.destroy()
+                self.live_window = None
+
+        except Exception as e:
+            self.logger.error(f"Error closing live plot: {e}")
+
+    def _load_previous_calibration(self):
+        """Load previous calibration data"""
+        try:
+            success, cal_data = self.file_manager.load_calibration()
+
+            if success and cal_data:
+                self.data_processor.calibration_values = cal_data.get(
+                    'calibration_values', [1.0, 1.0, 1.0, 1.0]
+                )
+                self.data_processor.tare_values = cal_data.get(
+                    'tare_values', [0.0, 0.0, 0.0, 0.0]
+                )
+                self.data_processor.is_calibrated = cal_data.get('is_calibrated', False)
+                self.data_processor.is_tared = cal_data.get('is_tared', False)
+
+                if self.data_processor.is_calibrated or self.data_processor.is_tared:
+                    self._update_status("Previous calibration loaded")
+                    self.logger.info("Previous calibration data loaded successfully")
+
+        except Exception as e:
+            self.logger.error(f"Failed to load previous calibration: {e}")
+
+    def _save_calibration_data(self):
+        """Save current calibration data"""
+        try:
             cal_data = {
-                'calibration_values': self.calibration_values,
-                'tare_values': self.tare_values if self.tare_values else [0.0, 0.0, 0.0, 0.0],
-                'timestamp': time.time(),
-                'is_calibrated': self.is_calibrated,
-                'is_tared': self.is_tared
+                'calibration_values': self.data_processor.calibration_values or [1.0, 1.0, 1.0, 1.0],
+                'tare_values': self.data_processor.tare_values or [0.0, 0.0, 0.0, 0.0],
+                'is_calibrated': self.data_processor.is_calibrated,
+                'is_tared': self.data_processor.is_tared,
+                'timestamp': time.time()
             }
 
-            try:
-                cal_file_path = self.get_calibration_file_path()
-                with open(cal_file_path, 'w') as f:
-                    json.dump(cal_data, f, indent=2)
-                print(f"Calibration saved to: {cal_file_path}")
-                return True
-            except Exception as e:
-                print(f"Error saving calibration: {e}")
-                return False
-        return False
+            self.file_manager.save_calibration(cal_data)
 
-    def load_calibration_values(self):
-        """
-        Load calibration values from JSON file if it exists
-        """
-        try:
-            cal_file_path = self.get_calibration_file_path()
-            if os.path.exists(cal_file_path):
-                with open(cal_file_path, 'r') as f:
-                    cal_data = json.load(f)
-
-                self.calibration_values = cal_data.get('calibration_values', [1.0, 1.0, 1.0, 1.0])
-                self.tare_values = cal_data.get('tare_values', [0.0, 0.0, 0.0, 0.0])
-                self.is_calibrated = cal_data.get('is_calibrated', False)
-                self.is_tared = cal_data.get('is_tared', False)
-
-                print(f"Calibration loaded from: {cal_file_path}")
-                print(f"Calibration values: {self.calibration_values}")
-                print(f"Tare values: {self.tare_values}")
-
-                # Update status to show loaded calibration
-                if self.is_calibrated:
-                    self.update_status("Previous calibration loaded!")
-
-                return True
-            else:
-                print("No previous calibration file found")
-                return False
         except Exception as e:
-            print(f"Error loading calibration: {e}")
-            return False
+            self.logger.error(f"Failed to save calibration data: {e}")
+
+    def _update_status(self, status: str):
+        """Update status display thread-safely"""
+
+        def update():
+            self.status_text.set(status)
+
+        if threading.current_thread() == threading.main_thread():
+            update()
+        else:
+            self.root.after(0, update)
+
+    def _enable_buttons(self):
+        """Enable buttons when connected"""
+        self.record_button.config(state="normal")
+        self.tare_button.config(state="normal")
+        self.calibrate_button.config(state="normal")
+        self.live_button.config(state="normal")
+        self.cal_status_button.config(state="normal")
+        self.reset_cal_button.config(state="normal")
+
+        # Disable connection controls
+        self.connect_button.config(state="disabled")
+        self.serial_port_combobox.config(state="disabled")
+
+    def _disable_buttons(self):
+        """Disable buttons when not connected"""
+        self.record_button.config(state="disabled")
+        self.stop_button.config(state="disabled")
+        self.save_button.config(state="disabled")
+        self.tare_button.config(state="disabled")
+        self.calibrate_button.config(state="disabled")
+        self.view_button.config(state="disabled")
+        self.live_button.config(state="disabled")
+        self.cal_status_button.config(state="disabled")
+        self.reset_cal_button.config(state="disabled")
+
+        # Enable connection controls
+        self.connect_button.config(state="normal")
+        self.serial_port_combobox.config(state="normal")
+
+    def _on_closing(self):
+        """Handle application closing with cleanup"""
+        try:
+            self.logger.info("Application closing...")
+
+            # Check for unsaved data
+            if self.unsaved_data:
+                result = messagebox.askyesno(
+                    "Unsaved Data",
+                    "There is unsaved data. Do you want to save before closing?"
+                )
+                if result:
+                    # Save data synchronously before closing
+                    try:
+                        data = self.data_processor.get_recording_data()
+                        success, message = self.file_manager.save_data(data)
+                        if not success:
+                            self.logger.error(f"Failed to save data on exit: {message}")
+                    except Exception as e:
+                        self.logger.error(f"Error saving data on exit: {e}")
+
+            # Close live plot window
+            if self.live_plot_active:
+                self._close_live_plot()
+
+            # Close progress dialog
+            if self.current_progress_dialog:
+                self.current_progress_dialog.close()
+
+            # Disconnect serial
+            if self.serial_handler:
+                self.serial_handler.disconnect()
+
+            # Stop data processing
+            if self.data_processor:
+                self.data_processor.clear_live_data()
+
+            self.logger.info("Application cleanup completed")
+
+            # Destroy the window
+            self.root.destroy()
+
+        except Exception as e:
+            self.logger.error(f"Error during application shutdown: {e}")
+            # Force close if cleanup fails
+            self.root.destroy()
+
+    def _signal_handler(self, signum, frame):
+        """Handle system signals for graceful shutdown"""
+        self.logger.info(f"Received signal {signum}, shutting down...")
+        self._on_closing()
 
     def run(self):
-        self.root.mainloop()
+        """Run the application"""
+        try:
+            self.logger.info("Starting application main loop")
+            self.root.mainloop()
+        except Exception as e:
+            self.logger.error(f"Application main loop failed: {e}", exc_info=True)
+        finally:
+            self.logger.info("Application terminated")
+
+
+def main():
+    """Main entry point"""
+    try:
+        # Create and run application
+        root = tk.Tk()
+        app = WalkerMonitorApp(root)
+        app.run()
+    except Exception as e:
+        print(f"Failed to start application: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = WalkerMonitorApp(root)
-    app.run()
+    main()

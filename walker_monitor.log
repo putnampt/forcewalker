@@ -1,0 +1,46 @@
+2025-09-09 20:32:24,030 - WalkerMonitor - INFO - Application starting...
+2025-09-09 20:32:24,060 - WalkerMonitor - INFO - Found 2 serial ports
+2025-09-09 20:32:24,063 - WalkerMonitor - INFO - Calibration data loaded successfully
+2025-09-09 20:32:24,063 - WalkerMonitor - INFO - Previous calibration data loaded successfully
+2025-09-09 20:32:24,063 - WalkerMonitor - INFO - Application initialized successfully
+2025-09-09 20:32:24,063 - WalkerMonitor - INFO - Starting application main loop
+2025-09-09 20:32:43,627 - WalkerMonitor - INFO - Attempting to connect to COM3
+2025-09-09 20:32:43,652 - WalkerMonitor - INFO - Successfully connected to COM3
+2025-09-09 20:32:47,234 - WalkerMonitor - INFO - Found 3 serial ports
+2025-09-09 20:32:50,477 - WalkerMonitor - INFO - Application closing...
+2025-09-09 20:32:50,482 - WalkerMonitor - INFO - Serial port closed
+2025-09-09 20:32:50,482 - WalkerMonitor - INFO - Application cleanup completed
+2025-09-09 20:32:50,491 - WalkerMonitor - INFO - Application terminated
+2025-09-09 20:32:53,118 - WalkerMonitor - INFO - Application starting...
+2025-09-09 20:32:53,138 - WalkerMonitor - INFO - Found 3 serial ports
+2025-09-09 20:32:53,140 - WalkerMonitor - INFO - Calibration data loaded successfully
+2025-09-09 20:32:53,140 - WalkerMonitor - INFO - Previous calibration data loaded successfully
+2025-09-09 20:32:53,140 - WalkerMonitor - INFO - Application initialized successfully
+2025-09-09 20:32:53,141 - WalkerMonitor - INFO - Starting application main loop
+2025-09-09 20:32:54,579 - WalkerMonitor - INFO - Attempting to connect to COM4
+2025-09-09 20:32:54,611 - WalkerMonitor - INFO - Successfully connected to COM4
+2025-09-09 20:33:28,637 - WalkerMonitor - INFO - Tare values set: [-73.54035087719298, -33.12982456140351, -61.27017543859649, -0.45614035087719296]
+2025-09-09 20:33:28,638 - WalkerMonitor - INFO - Calibration data saved successfully
+2025-09-09 20:33:47,504 - WalkerMonitor - WARNING - Too many consecutive validation errors (111)
+2025-09-09 20:34:23,325 - WalkerMonitor - INFO - Tare values set: [-644.4851851851852, -141.61481481481482, 225.9814814814815, -1019.7148148148148]
+2025-09-09 20:34:23,327 - WalkerMonitor - INFO - Calibration data saved successfully
+2025-09-09 20:34:43,745 - WalkerMonitor - INFO - Application closing...
+2025-09-09 20:34:43,748 - WalkerMonitor - INFO - Serial port closed
+2025-09-09 20:34:43,748 - WalkerMonitor - INFO - Application cleanup completed
+2025-09-09 20:34:43,756 - WalkerMonitor - INFO - Application terminated
+2025-09-09 20:34:47,099 - WalkerMonitor - INFO - Application starting...
+2025-09-09 20:34:47,117 - WalkerMonitor - INFO - Found 3 serial ports
+2025-09-09 20:34:47,120 - WalkerMonitor - INFO - Calibration data loaded successfully
+2025-09-09 20:34:47,120 - WalkerMonitor - INFO - Previous calibration data loaded successfully
+2025-09-09 20:34:47,120 - WalkerMonitor - INFO - Application initialized successfully
+2025-09-09 20:34:47,120 - WalkerMonitor - INFO - Starting application main loop
+2025-09-09 20:35:05,724 - WalkerMonitor - INFO - Attempting to connect to COM4
+2025-09-09 20:35:05,755 - WalkerMonitor - INFO - Successfully connected to COM4
+2025-09-09 20:35:54,865 - WalkerMonitor - INFO - Tare values set: [-24.764505119453926, 29.62457337883959, -10.972696245733788, 5.460750853242321]
+2025-09-09 20:35:54,866 - WalkerMonitor - INFO - Calibration data saved successfully
+2025-09-09 20:36:57,834 - WalkerMonitor - WARNING - Too many consecutive validation errors (204)
+2025-09-09 20:36:59,374 - WalkerMonitor - WARNING - Too many consecutive validation errors (66)
+2025-09-09 20:38:25,888 - WalkerMonitor - INFO - Application closing...
+2025-09-09 20:38:25,891 - WalkerMonitor - INFO - Serial port closed
+2025-09-09 20:38:25,892 - WalkerMonitor - INFO - Application cleanup completed
+2025-09-09 20:38:25,901 - WalkerMonitor - INFO - Application terminated
