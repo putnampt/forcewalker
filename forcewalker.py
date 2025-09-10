@@ -430,32 +430,106 @@ class WalkerMonitorApp:
                 # Use the new data folder path method
                 data_folder = self.get_data_folder_path()
 
-                hd_filename = os.path.join(data_folder, f"FW_{time.strftime('%Y-%m-%d_%H-%M-%S')}.h5")
+                # Generate base filename with timestamp
+                base_filename = f"FW_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+
+                # 1. Save H5 format (existing code)
+                hd_filename = os.path.join(data_folder, f"{base_filename}.h5")
                 with h5py.File(hd_filename, 'w') as f:
                     f.create_dataset('rr', data=np.array(self.data['rr']))
                     f.create_dataset('rf', data=np.array(self.data['rf']))
                     f.create_dataset('lr', data=np.array(self.data['lr']))
                     f.create_dataset('lf', data=np.array(self.data['lf']))
-
                 print(f"H5 Data saved to {hd_filename}")
 
+                # Create DataFrames for each sensor
                 df_rr = pd.DataFrame(self.data['rr'], columns=['Timestamp', 'Right-Rear'])
                 df_rf = pd.DataFrame(self.data['rf'], columns=['Timestamp', 'Right-Front'])
                 df_lr = pd.DataFrame(self.data['lr'], columns=['Timestamp', 'Left-Rear'])
                 df_lf = pd.DataFrame(self.data['lf'], columns=['Timestamp', 'Left-Front'])
 
-                # Save to Excel
-                excel_filename = os.path.join(data_folder, f"FW_{time.strftime('%Y-%m-%d_%H-%M-%S')}.xlsx")
-
-                with pd.ExcelWriter(excel_filename) as writer:
+                # 2. Save to Excel XLSX format (existing code)
+                excel_filename = os.path.join(data_folder, f"{base_filename}.xlsx")
+                with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
                     df_rr.to_excel(writer, sheet_name='RR', index=False)
                     df_rf.to_excel(writer, sheet_name='RF', index=False)
                     df_lr.to_excel(writer, sheet_name='LR', index=False)
                     df_lf.to_excel(writer, sheet_name='LF', index=False)
+                print(f"Excel XLSX Data saved to {excel_filename}")
 
-                print(f"Excel Data saved to {excel_filename}")
+                # 3. Save to Excel XLS format (legacy Excel format)
+                try:
+                    xls_filename = os.path.join(data_folder, f"{base_filename}.xls")
+                    with pd.ExcelWriter(xls_filename, engine='xlwt') as writer:
+                        df_rr.to_excel(writer, sheet_name='RR', index=False)
+                        df_rf.to_excel(writer, sheet_name='RF', index=False)
+                        df_lr.to_excel(writer, sheet_name='LR', index=False)
+                        df_lf.to_excel(writer, sheet_name='LF', index=False)
+                    print(f"Excel XLS Data saved to {xls_filename}")
+                except Exception as e:
+                    print(f"Warning: Could not save XLS format - {e}")
+                    print("Note: You may need to install xlwt: pip install xlwt")
 
-                self.update_status("Data Saved!")
+                # 4. Save to CSV format - Combined file with all sensors
+                csv_filename = os.path.join(data_folder, f"{base_filename}_combined.csv")
+
+                # Create a combined DataFrame with all sensors
+                # Find the maximum length to handle potential different lengths
+                max_length = max(len(self.data['rr']), len(self.data['rf']),
+                                 len(self.data['lr']), len(self.data['lf']))
+
+                # Create lists for combined data
+                combined_data = []
+
+                # Combine all data points by timestamp
+                all_timestamps = set()
+                for sensor_data in [self.data['rr'], self.data['rf'], self.data['lr'], self.data['lf']]:
+                    for timestamp, _ in sensor_data:
+                        all_timestamps.add(timestamp)
+
+                # Sort timestamps
+                sorted_timestamps = sorted(all_timestamps)
+
+                # Create dictionaries for quick lookup
+                rr_dict = {t: v for t, v in self.data['rr']}
+                rf_dict = {t: v for t, v in self.data['rf']}
+                lr_dict = {t: v for t, v in self.data['lr']}
+                lf_dict = {t: v for t, v in self.data['lf']}
+
+                # Build combined dataset
+                for timestamp in sorted_timestamps:
+                    row = {
+                        'Timestamp': timestamp,
+                        'Right-Rear': rr_dict.get(timestamp, ''),
+                        'Right-Front': rf_dict.get(timestamp, ''),
+                        'Left-Rear': lr_dict.get(timestamp, ''),
+                        'Left-Front': lf_dict.get(timestamp, '')
+                    }
+                    combined_data.append(row)
+
+                # Create DataFrame and save
+                df_combined = pd.DataFrame(combined_data)
+                df_combined.to_csv(csv_filename, index=False, float_format='%.6f')
+                print(f"Combined CSV Data saved to {csv_filename}")
+
+                # 5. Save individual CSV files for each sensor (optional)
+                csv_rr_filename = os.path.join(data_folder, f"{base_filename}_RR.csv")
+                csv_rf_filename = os.path.join(data_folder, f"{base_filename}_RF.csv")
+                csv_lr_filename = os.path.join(data_folder, f"{base_filename}_LR.csv")
+                csv_lf_filename = os.path.join(data_folder, f"{base_filename}_LF.csv")
+
+                df_rr.to_csv(csv_rr_filename, index=False, float_format='%.6f')
+                df_rf.to_csv(csv_rf_filename, index=False, float_format='%.6f')
+                df_lr.to_csv(csv_lr_filename, index=False, float_format='%.6f')
+                df_lf.to_csv(csv_lf_filename, index=False, float_format='%.6f')
+
+                print(f"Individual CSV files saved:")
+                print(f"  - {csv_rr_filename}")
+                print(f"  - {csv_rf_filename}")
+                print(f"  - {csv_lr_filename}")
+                print(f"  - {csv_lf_filename}")
+
+                self.update_status("Data Saved in all formats!")
                 self.unsaved_data = False
         else:
             self.update_status("No Recording found in memory!")
